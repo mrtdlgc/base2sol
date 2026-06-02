@@ -1,0 +1,15 @@
+node_modules
+.next
+.env
+.env.local
+*.tsbuildinfo
+next-env.d.ts
+dist
+.DS_Store
+.codex-audit
+.npm-cache
+.claude
+
+# logs
+*.log
+.next-dev*.log

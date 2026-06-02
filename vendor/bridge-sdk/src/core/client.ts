@@ -1,0 +1,260 @@
+import { type Logger, NOOP_LOGGER } from "../utils/logger";
+import { BridgeUnsupportedRouteError } from "./errors";
+import { mergeBridgeDeployments } from "./protocol/deployments";
+import {
+  resolveBridgeRoute,
+  routeMapKey,
+  supportsBridgeRoute,
+} from "./protocol/router";
+import type {
+  BridgeConfig,
+  BridgeOperation,
+  BridgeRequest,
+  BridgeRoute,
+  CallRequestInput,
+  ChainAdapter,
+  ChainId,
+  ExecuteOptions,
+  ExecuteResult,
+  ExecutionStatus,
+  MessageRef,
+  MonitorOptions,
+  ProveOptions,
+  ProveResult,
+  Quote,
+  QuoteRequest,
+  RelayOptions,
+  RouteAdapter,
+  RouteCapabilities,
+  StatusOptions,
+  TransferRequestInput,
+  WrapTokenOperation,
+  WrapTokenRequestInput,
+} from "./types";
+import { validateAction } from "./validation";
+
+export interface BridgeClientConfig {
+  /** Registered chains and their adapters. */
+  chains: Record<string, ChainAdapter>;
+
+  /**
+   * Bridge-specific configuration.
+   */
+  bridgeConfig?: {
+    /** Optional token identifier mapping overrides. */
+    tokenMappings?: BridgeConfig["tokenMappings"];
+
+    /**
+     * Optional deployment overrides. Use this when targeting additional networks
+     * (e.g. Base Sepolia, Solana devnet) or if contracts are redeployed.
+     */
+    deployments?: Partial<BridgeConfig["deployments"]>;
+  };
+
+  /** Optional default behavior for monitoring/retries/logging. */
+  defaults?: {
+    monitor?: MonitorOptions;
+    relay?: RelayOptions;
+  };
+
+  logger?: Logger;
+}
+
+export interface BridgeClient {
+  /** Convenience helpers */
+  transfer(req: TransferRequestInput): Promise<BridgeOperation>;
+  wrapToken(req: WrapTokenRequestInput): Promise<WrapTokenOperation>;
+  call(req: CallRequestInput): Promise<BridgeOperation>;
+  request(req: BridgeRequest): Promise<BridgeOperation>;
+
+  /** Quote estimation (get fees, timing, limits without committing) */
+  quote(req: QuoteRequest): Promise<Quote>;
+
+  /** Step execution (route-dependent; see capabilities) */
+  prove(ref: MessageRef, opts?: ProveOptions): Promise<ProveResult>;
+  execute(ref: MessageRef, opts?: ExecuteOptions): Promise<ExecuteResult>;
+
+  /** Monitoring (polling/subscriptions/indexer adapters) */
+  status(ref: MessageRef, opts?: StatusOptions): Promise<ExecutionStatus>;
+  monitor(
+    ref: MessageRef,
+    opts?: MonitorOptions,
+  ): AsyncIterable<ExecutionStatus>;
+
+  /** Discovery */
+  resolveRoute(route: BridgeRoute): Promise<BridgeRoute>;
+  capabilities(route: BridgeRoute): Promise<RouteCapabilities>;
+}
+
+class DefaultBridgeClient implements BridgeClient {
+  private readonly chains: Record<ChainId, ChainAdapter>;
+  private readonly bridge: BridgeConfig;
+  private readonly logger: Logger;
+  private readonly defaults: BridgeClientConfig["defaults"];
+
+  private readonly adapterCache = new Map<string, Promise<RouteAdapter>>();
+
+  constructor(config: BridgeClientConfig & { bridge: BridgeConfig }) {
+    this.chains = config.chains;
+    this.bridge = config.bridge;
+    this.logger = config.logger ?? NOOP_LOGGER;
+    this.defaults = config.defaults;
+  }
+
+  async transfer(req: TransferRequestInput): Promise<BridgeOperation> {
+    const bridgeReq: BridgeRequest = {
+      route: req.route,
+      action: {
+        kind: "transfer",
+        asset: req.asset,
+        amount: req.amount,
+        recipient: req.recipient,
+        call: req.call,
+      },
+      idempotencyKey: req.idempotencyKey,
+      relay: req.relay ?? this.defaults?.relay,
+      metadata: req.metadata,
+    };
+    return await this.request(bridgeReq);
+  }
+
+  async wrapToken(req: WrapTokenRequestInput): Promise<WrapTokenOperation> {
+    const adapter = await this.getRouteAdapter(req.route);
+    if (!adapter.wrapToken) {
+      throw new BridgeUnsupportedRouteError(req.route);
+    }
+    this.logger.debug(
+      `bridge.wrapToken: ${req.route.sourceChain} -> ${req.route.destinationChain}`,
+    );
+    return await adapter.wrapToken(req);
+  }
+
+  async call(req: CallRequestInput): Promise<BridgeOperation> {
+    const bridgeReq: BridgeRequest = {
+      route: req.route,
+      action: { kind: "call", call: req.call },
+      idempotencyKey: req.idempotencyKey,
+      relay: req.relay ?? this.defaults?.relay,
+      metadata: req.metadata,
+    };
+    return await this.request(bridgeReq);
+  }
+
+  async request(req: BridgeRequest): Promise<BridgeOperation> {
+    validateAction(req.action, req.route);
+    const adapter = await this.getRouteAdapter(req.route);
+    this.logger.debug(
+      `bridge.request: initiating ${req.route.sourceChain} -> ${req.route.destinationChain}`,
+    );
+    return await adapter.initiate(req);
+  }
+
+  async quote(req: QuoteRequest): Promise<Quote> {
+    validateAction(req.action, req.route);
+    const adapter = await this.getRouteAdapter(req.route);
+    this.logger.debug(
+      `bridge.quote: estimating ${req.route.sourceChain} -> ${req.route.destinationChain}`,
+    );
+    return await adapter.quote(req);
+  }
+
+  async prove(ref: MessageRef, opts?: ProveOptions): Promise<ProveResult> {
+    const adapter = await this.getRouteAdapter(ref.route);
+    this.logger.debug(
+      `bridge.prove: ${ref.route.sourceChain} -> ${ref.route.destinationChain}`,
+    );
+    return await adapter.prove(ref, opts);
+  }
+
+  async execute(
+    ref: MessageRef,
+    opts?: ExecuteOptions,
+  ): Promise<ExecuteResult> {
+    const adapter = await this.getRouteAdapter(ref.route);
+    this.logger.debug(
+      `bridge.execute: ${ref.route.sourceChain} -> ${ref.route.destinationChain}`,
+    );
+    return await adapter.execute(ref, opts);
+  }
+
+  async status(
+    ref: MessageRef,
+    opts?: StatusOptions,
+  ): Promise<ExecutionStatus> {
+    const adapter = await this.getRouteAdapter(ref.route);
+    return await adapter.status(ref, opts);
+  }
+
+  async *monitor(
+    ref: MessageRef,
+    opts?: MonitorOptions,
+  ): AsyncIterable<ExecutionStatus> {
+    const adapter = await this.getRouteAdapter(ref.route);
+    const merged: MonitorOptions = {
+      ...this.defaults?.monitor,
+      ...opts,
+    };
+    yield* adapter.monitor(ref, merged);
+  }
+
+  async resolveRoute(route: BridgeRoute): Promise<BridgeRoute> {
+    if (!supportsBridgeRoute(route))
+      throw new BridgeUnsupportedRouteError(route);
+    return route;
+  }
+
+  async capabilities(route: BridgeRoute): Promise<RouteCapabilities> {
+    const adapter = await this.getRouteAdapter(route);
+    return await adapter.capabilities();
+  }
+
+  private getRouteAdapter(route: BridgeRoute): Promise<RouteAdapter> {
+    const key = routeMapKey(route);
+
+    const existing = this.adapterCache.get(key);
+    if (existing) {
+      this.logger.debug(
+        `bridge.resolveRoute: cache hit for ${route.sourceChain} -> ${route.destinationChain}`,
+      );
+      return existing;
+    }
+
+    this.logger.debug(
+      `bridge.resolveRoute: constructing adapter for ${route.sourceChain} -> ${route.destinationChain}`,
+    );
+    const created = resolveBridgeRoute(
+      route,
+      this.chains,
+      this.bridge,
+      this.logger,
+    );
+    created.catch(() => this.adapterCache.delete(key));
+    this.adapterCache.set(key, created);
+    return created;
+  }
+}
+
+export function createBridgeClient(config: BridgeClientConfig): BridgeClient {
+  const chains: Record<ChainId, ChainAdapter> = {};
+  for (const adapter of Object.values(config.chains)) {
+    const id = adapter.chain.id;
+    if (chains[id]) {
+      throw new Error(
+        `Duplicate chain adapter registered for ${id}. Ensure each adapter has a unique chain id.`,
+      );
+    }
+    chains[id] = adapter;
+  }
+
+  const deployments = mergeBridgeDeployments(config.bridgeConfig?.deployments);
+  const bridge: BridgeConfig = {
+    deployments,
+    tokenMappings: config.bridgeConfig?.tokenMappings,
+  };
+
+  return new DefaultBridgeClient({
+    ...config,
+    chains,
+    bridge,
+  });
+}

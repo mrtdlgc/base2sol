@@ -1,0 +1,24 @@
+{
+  "name": "bridge-sdk",
+  "version": "0.1.0",
+  "description": "Vendored Base Bridge SDK. Pinned copy of github.com/base/bridge-sdk, prebuilt to dist/. Rebuild with: npm run build",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./chains": { "types": "./dist/chains/index.d.ts", "import": "./dist/chains/index.js" },
+    "./node": { "types": "./dist/node/index.d.ts", "import": "./dist/node/index.js" }
+  },
+  "scripts": {
+    "build": "tsc --noCheck -p tsconfig.dist.json && node scripts/fix-esm-imports.mjs"
+  },
+  "author": "Base",
+  "license": "MIT",
+  "dependencies": {
+    "@solana-program/token": "0.9.0",
+    "@solana/kit": "5.0.0",
+    "viem": "2.51.3"
+  }
+}

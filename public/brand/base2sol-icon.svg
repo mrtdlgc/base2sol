@@ -1,0 +1,38 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1024" height="1024" rx="220" fill="#070815"/>
+  <rect width="1024" height="1024" rx="220" fill="url(#bg)"/>
+  <path d="M0 184C210 122 383 143 520 247C655 349 821 358 1024 274V0H0V184Z" fill="#0000FF" fill-opacity="0.38"/>
+  <path d="M1024 753C814 845 636 831 491 711C350 594 189 568 0 640V1024H1024V753Z" fill="#14F195" fill-opacity="0.2"/>
+  <path d="M797 92L958 172L843 422L682 342L797 92Z" fill="#9945FF" fill-opacity="0.42"/>
+  <path d="M787 99L951 181L938 208L774 126L787 99Z" fill="#14F195"/>
+  <path d="M776 127L940 209L927 236L763 154L776 127Z" fill="#00C2FF"/>
+  <path d="M765 155L929 237L916 264L752 182L765 155Z" fill="#9945FF"/>
+  <circle cx="512" cy="512" r="334" fill="#07111F" fill-opacity="0.7"/>
+  <circle cx="512" cy="512" r="331" stroke="url(#ring)" stroke-width="6"/>
+  <text x="512" y="566" text-anchor="middle" dominant-baseline="middle" font-family="Arial Black, Arial, Helvetica, sans-serif" font-size="246" font-weight="900" letter-spacing="-14">
+    <tspan fill="#FFFFFF">b</tspan><tspan fill="url(#textGradient)">2s</tspan>
+  </text>
+  <path d="M231 767H793" stroke="url(#bar)" stroke-width="18" stroke-linecap="round"/>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0000FF"/>
+      <stop offset="0.48" stop-color="#9945FF"/>
+      <stop offset="1" stop-color="#14F195"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="181" y1="181" x2="843" y2="843" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0000FF"/>
+      <stop offset="0.47" stop-color="#00C2FF"/>
+      <stop offset="1" stop-color="#14F195"/>
+    </linearGradient>
+    <linearGradient id="textGradient" x1="565" y1="360" x2="812" y2="694" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#9945FF"/>
+      <stop offset="0.48" stop-color="#00C2FF"/>
+      <stop offset="1" stop-color="#14F195"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="231" y1="767" x2="793" y2="767" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0000FF"/>
+      <stop offset="0.5" stop-color="#9945FF"/>
+      <stop offset="1" stop-color="#14F195"/>
+    </linearGradient>
+  </defs>
+</svg>

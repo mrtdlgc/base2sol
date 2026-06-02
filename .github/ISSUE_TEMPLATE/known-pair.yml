@@ -1,0 +1,106 @@
+name: Known pair request
+description: Request inclusion in the base2sol known-pairs list.
+title: "[Known pair]: "
+labels:
+  - known-pair-request
+  - needs-review
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to request a convenience listing in base2sol's known-pairs list.
+
+        Inclusion means the pair is easier to select in the app. It is not an endorsement, listing agreement, liquidity guarantee, or security certification.
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      options:
+        - Base mainnet / Solana mainnet-beta
+        - Base Sepolia / Solana devnet
+    validations:
+      required: true
+  - type: input
+    id: label
+    attributes:
+      label: Requested display label
+      placeholder: B2S
+    validations:
+      required: true
+  - type: input
+    id: base_token
+    attributes:
+      label: Base ERC20 address
+      placeholder: "0x..."
+      description: The Base-side ERC20 contract address.
+    validations:
+      required: true
+  - type: input
+    id: solana_mint
+    attributes:
+      label: Solana mint or native-SOL sentinel
+      placeholder: "Solana mint address or SoL1111111111111111111111111111111111111111"
+    validations:
+      required: true
+  - type: input
+    id: base_decimals
+    attributes:
+      label: Base token decimals
+      placeholder: "18"
+    validations:
+      required: true
+  - type: input
+    id: solana_decimals
+    attributes:
+      label: Solana token decimals
+      placeholder: "9"
+    validations:
+      required: true
+  - type: input
+    id: bridge_registration_tx
+    attributes:
+      label: Bridge registration or verification transaction
+      placeholder: "Base or Solana explorer URL"
+      description: Link to the transaction that registered this pair, or another transaction proving the mapping works.
+    validations:
+      required: true
+  - type: textarea
+    id: official_sources
+    attributes:
+      label: Official sources
+      description: Link official docs, website pages, announcements, or repository references that publish both token addresses.
+      placeholder: |
+        - Website:
+        - Docs:
+        - Announcement:
+    validations:
+      required: true
+  - type: dropdown
+    id: requester_role
+    attributes:
+      label: Requester role
+      options:
+        - Token team member
+        - Ecosystem/tooling maintainer
+        - Community member
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional notes
+      description: Include context reviewers should know, such as prior migrations, multiple token contracts, or temporary caveats.
+    validations:
+      required: false
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Acknowledgements
+      options:
+        - label: I understand that known-pair inclusion is a convenience listing, not a security review or endorsement.
+          required: true
+        - label: I have verified the Base token address, Solana mint, decimals, and bridge registration before submitting.
+          required: true
+        - label: I understand maintainers may reject, rename, or remove listings if the evidence is incomplete or stale.
+          required: true
