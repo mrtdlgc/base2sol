@@ -102,6 +102,11 @@ const ETH_ADDRESS =
   "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE" as EvmAddress;
 const ALLOWANCE_VISIBILITY_TIMEOUT_MS = 30_000;
 const ALLOWANCE_VISIBILITY_POLL_INTERVAL_MS = 1_000;
+const BASE_MAINNET_CHAIN_ID = 8453;
+const BASE_MAINNET_PROOF_RPC_URLS = [
+  "https://mainnet.base.org",
+  "https://1rpc.io/base",
+];
 
 const ERC20_ABI = [
   {
@@ -125,6 +130,10 @@ const ERC20_ABI = [
     stateMutability: "nonpayable",
   },
 ] as const;
+
+function normalizeRpcUrl(value: string): string {
+  return value.replace(/\/+$/, "");
+}
 
 export class BaseEngine {
   private readonly config: BaseEngineConfig;
@@ -177,6 +186,30 @@ export class BaseEngine {
       walletClient: this.walletClient,
       account: this.account,
     };
+  }
+
+  private proofPublicClients(): { rpcUrl: string; client: PublicClient }[] {
+    const configured = this.config.rpcUrl.trim();
+    const candidates =
+      this.config.chain.id === BASE_MAINNET_CHAIN_ID
+        ? [...BASE_MAINNET_PROOF_RPC_URLS, configured]
+        : [configured];
+    const seen = new Set<string>();
+    return candidates
+      .filter(Boolean)
+      .filter((rpcUrl) => {
+        const normalized = normalizeRpcUrl(rpcUrl);
+        if (seen.has(normalized)) return false;
+        seen.add(normalized);
+        return true;
+      })
+      .map((rpcUrl) => ({
+        rpcUrl,
+        client: createPublicClient({
+          chain: this.config.chain,
+          transport: http(rpcUrl),
+        }) as PublicClient,
+      }));
   }
 
   private async confirmTransaction(
@@ -508,13 +541,35 @@ export class BaseEngine {
       `baseEngine.generateProof: decoded MessageInitiated event, nonce=${event.message.nonce}`,
     );
 
-    const rawProof = await this.publicClient.readContract({
-      address: this.config.bridgeContract,
-      abi: BRIDGE_ABI,
-      functionName: "generateProof",
-      args: [event.message.nonce],
-      blockNumber,
-    });
+    const proofErrors: string[] = [];
+    let rawProof: `0x${string}`[] | undefined;
+    for (const { rpcUrl, client } of this.proofPublicClients()) {
+      try {
+        rawProof = await client.readContract({
+          address: this.config.bridgeContract,
+          abi: BRIDGE_ABI,
+          functionName: "generateProof",
+          args: [event.message.nonce],
+          blockNumber,
+        });
+        if (normalizeRpcUrl(rpcUrl) !== normalizeRpcUrl(this.config.rpcUrl)) {
+          this.logger.info(
+            `baseEngine.generateProof: proof read from ${rpcUrl}`,
+          );
+        }
+        break;
+      } catch (e) {
+        const message = e instanceof Error ? e.message.split("\n")[0] : String(e);
+        proofErrors.push(`${rpcUrl}: ${message}`);
+      }
+    }
+
+    if (!rawProof) {
+      throw new BridgeProofNotAvailableError(
+        `Could not generate Base proof at block ${blockNumber}: ${proofErrors.join(" | ")}`,
+        context,
+      );
+    }
 
     this.logger.info(
       `baseEngine.generateProof: proof generated for nonce=${event.message.nonce}, blockNumber=${blockNumber}`,

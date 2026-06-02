@@ -1614,6 +1614,26 @@ export class SolanaEngine {
       (tx) => addSignersToTransactionMessage(allSigners, tx),
     );
 
+    const simulationTx = compileTransaction(transactionMessage);
+    const simulation = await this.rpc
+      .simulateTransaction(getBase64EncodedWireTransaction(simulationTx), {
+        encoding: "base64",
+        replaceRecentBlockhash: true,
+        commitment: "confirmed",
+      })
+      .send();
+
+    if (simulation.value.err) {
+      const logs = simulation.value.logs?.slice(-12).join(" / ") ?? "no logs";
+      const err = JSON.stringify(simulation.value.err, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value,
+      );
+      this.logger.error(
+        `solanaEngine.buildAndSendTransaction: simulation failed before wallet signing, err=${err}, logs=${logs}`,
+      );
+      throw new Error(`Solana transaction simulation failed: err=${err}; logs=${logs}`);
+    }
+
     const signedTransaction =
       await signTransactionMessageWithSigners(transactionMessage);
     const signature = getSignatureFromTransaction(signedTransaction);

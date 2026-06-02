@@ -190,12 +190,33 @@ function parseStaleBridgeState(message: string): { bridgeBlock: string; transact
   return { bridgeBlock: match[1], transactionBlock: match[2] };
 }
 
-function isSolanaBlockhashExpiry(message: string): boolean {
+function isSolanaConfirmationUnclear(message: string): boolean {
   return (
     message.includes("progressed past the last block") ||
     message.includes("BLOCK_HEIGHT_EXCEEDED") ||
-    message.includes("block height exceeded")
+    message.includes("block height exceeded") ||
+    message.includes("Cannot destructure property 'err' of 'data' as it is undefined") ||
+    message.includes("Cannot destructure property 'slot' of 'slotNotification' as it is null") ||
+    message.includes("Transaction was not confirmed") ||
+    message.includes("Timeout elapsed after")
   );
+}
+
+function statusBridgeStateBlock(status: ExecutionStatus | null): bigint | undefined {
+  if (
+    status &&
+    status.type === "Initiated" &&
+    "bridgeStateBlockNumber" in status &&
+    status.bridgeStateBlockNumber
+  ) {
+    const bridgeBlock = BigInt(status.bridgeStateBlockNumber);
+    const sourceBlock =
+      "sourceBlockNumber" in status && status.sourceBlockNumber
+        ? BigInt(status.sourceBlockNumber)
+        : undefined;
+    return sourceBlock === undefined || bridgeBlock >= sourceBlock ? bridgeBlock : undefined;
+  }
+  return undefined;
 }
 
 function statusLogMessage(status: ExecutionStatus): string {
@@ -265,6 +286,16 @@ function compactSubmittedBatch(op: PersistedOp): PersistedOp {
       chunks,
     },
   });
+}
+
+function updateProofMessageRef(op: PersistedOp, messageRef: MessageRef): PersistedOp {
+  if (op.transferBatch) {
+    return updateCurrentBatchChunk(op, {
+      messageRef,
+      proofTx: messageRef.derived?.proofTx,
+    });
+  }
+  return { ...op, messageRef };
 }
 
 function loadPersisted(network: BridgeNetwork): PersistedOp | null {
@@ -395,6 +426,16 @@ export function useBridgeOperation(deps: WalletDeps) {
         }
         if (message.includes("baseEngine.bridgeToken: submitted txHash=")) {
           addLog("ok", `Bridge transaction submitted: ${message.split("txHash=")[1] ?? message}`);
+          return;
+        }
+        if (
+          message.includes("baseEngine.generateProof:") ||
+          message.includes("solanaEngine.handleProveMessage:") ||
+          message.includes("solanaEngine.proveMessageBuffered:") ||
+          message.includes("solanaEngine.initializeProveBuffer:") ||
+          message.includes("solanaEngine.appendToProveBuffer")
+        ) {
+          addLog(level, message);
           return;
         }
         if (level !== "info") addLog(level, message);
@@ -945,9 +986,43 @@ export function useBridgeOperation(deps: WalletDeps) {
     setPhase("proving");
     addLog("info", "Generating proof and submitting it to Solana...");
     try {
-      const res = await clientFor(op.messageRef.route, op.tokenMapping).prove(op.messageRef);
+      const client = clientFor(op.messageRef.route, op.tokenMapping);
+      const sourceBlockNumber = statusBridgeStateBlock(statusRef.current);
+      let proveBlockNumber = sourceBlockNumber;
+      if (!proveBlockNumber) {
+        addLog("info", "Refreshing checkpoint status before proving...");
+        const currentStatus = await client.status(op.messageRef);
+        setStatus(currentStatus);
+        statusRef.current = currentStatus;
+        addLog(
+          currentStatus.type === "Failed" || currentStatus.type === "Expired" ? "error" : "info",
+          statusLogMessage(currentStatus)
+        );
+        if (currentStatus.type === "Executable") {
+          addLog("ok", "Message is already proven on Solana. Execute it next.");
+          return;
+        }
+        proveBlockNumber = statusBridgeStateBlock(currentStatus);
+      }
+      if (proveBlockNumber) {
+        addLog("info", `Proving against Solana-indexed Base block ${proveBlockNumber}.`);
+      }
+      const res = await client.prove(
+        op.messageRef,
+        proveBlockNumber ? { sourceBlockNumber: proveBlockNumber } : undefined
+      );
+      const updatedOp =
+        res.messageRef && messageRefKey(res.messageRef) === messageRefKey(op.messageRef)
+          ? updateProofMessageRef(op, res.messageRef)
+          : op;
+      setOp((prev) =>
+        prev && messageRefKey(prev.messageRef) === messageRefKey(op.messageRef)
+          ? updatedOp
+          : prev
+      );
+      persist(updatedOp, depsRef.current.network);
       addLog("ok", `Proof submitted: ${res.proofTx ?? "(n/a)"}`);
-      void checkStatus(op);
+      void checkStatus(updatedOp);
     } catch (e) {
       const message = (e as Error).message;
       const stale = parseStaleBridgeState(message);
@@ -958,8 +1033,8 @@ export function useBridgeOperation(deps: WalletDeps) {
         );
         return;
       }
-      if (isSolanaBlockhashExpiry(message)) {
-        addLog("warn", "Solana proof confirmation expired locally; checking on-chain status before retrying.");
+      if (isSolanaConfirmationUnclear(message)) {
+        addLog("warn", "Solana proof confirmation failed locally; checking on-chain status before retrying.");
         await checkStatus(op, { forceLog: true });
         return;
       }
@@ -984,8 +1059,8 @@ export function useBridgeOperation(deps: WalletDeps) {
         addLog("warn", "Message is not proven on Solana yet. Click Prove first, then Execute once status is Executable.");
         return;
       }
-      if (isSolanaBlockhashExpiry(message)) {
-        addLog("warn", "Solana execution confirmation expired locally; checking on-chain status before retrying.");
+      if (isSolanaConfirmationUnclear(message)) {
+        addLog("warn", "Solana execution confirmation failed locally; checking on-chain status before retrying.");
         await checkStatus(op, { forceLog: true });
         return;
       }
