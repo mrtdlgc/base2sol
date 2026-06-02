@@ -21,6 +21,7 @@ interface Props {
   onCheck: () => void;
   onReset: () => void;
   onRecoverRegistration: (signature: string) => Promise<unknown>;
+  onRecoverBaseTransfer: (txHash: string) => Promise<unknown>;
   recoverBusy: boolean;
 }
 
@@ -51,9 +52,11 @@ export function StepFlow({
   onCheck,
   onReset,
   onRecoverRegistration,
+  onRecoverBaseTransfer,
   recoverBusy,
 }: Props) {
   const [recoverySignature, setRecoverySignature] = useState("");
+  const [baseRecoveryTx, setBaseRecoveryTx] = useState("");
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const steps = capabilities?.steps ?? ["initiate", "prove", "execute", "monitor"];
   const proveSupported = steps.includes("prove") && capabilities?.prove !== false;
@@ -81,6 +84,17 @@ export function StepFlow({
     try {
       await onRecoverRegistration(cleanSignature);
       setRecoverySignature("");
+    } catch (e) {
+      setRecoveryError((e as Error).message);
+    }
+  }
+
+  async function submitBaseRecovery() {
+    const cleanTx = baseRecoveryTx.trim();
+    setRecoveryError(null);
+    try {
+      await onRecoverBaseTransfer(cleanTx);
+      setBaseRecoveryTx("");
     } catch (e) {
       setRecoveryError((e as Error).message);
     }
@@ -125,13 +139,46 @@ export function StepFlow({
               </div>
             )}
           </Field>
+          <Field label="Recover Base transfer">
+            <div className="row">
+              <input
+                value={baseRecoveryTx}
+                onChange={(e) => setBaseRecoveryTx(e.target.value)}
+                placeholder="Base bridge transaction hash"
+              />
+              <button
+                className="btn ghost"
+                disabled={recoverBusy}
+                onClick={() => void submitBaseRecovery()}
+              >
+                {recoverBusy ? "Recovering..." : "Recover"}
+              </button>
+            </div>
+          </Field>
         </>
       ) : (
         <div style={{ marginBottom: 14 }}>
           <KeyVal
             rows={[
-              ["operation", op.kind === "wrap-token" ? "register Base token on Solana" : "bridge transfer"],
+              [
+                "operation",
+                op.kind === "wrap-token"
+                  ? "register Base token on Solana"
+                  : op.transferBatch
+                    ? `bridge transfer chunk ${op.transferBatch.currentIndex + 1}/${op.transferBatch.totalChunks}`
+                    : "bridge transfer",
+              ],
               ["route", `${chainName(op.messageRef.route.sourceChain)} -> ${chainName(op.messageRef.route.destinationChain)}`],
+              ...(op.transferBatch
+                ? ([
+                    ["total amount", `${op.transferBatch.totalAmount} source units`],
+                    ["submitted chunks", `${op.transferBatch.chunks.length}/${op.transferBatch.totalChunks}`],
+                    [
+                      "current chunk",
+                      `${op.transferBatch.chunks[op.transferBatch.currentIndex]?.amount ?? "unknown"} source units`,
+                    ],
+                  ] as [string, string][])
+                : []),
               ["message", shortId(op.messageRef)],
               ["source tx", op.initiationTx ?? "(see activity)"],
               ["started", new Date(op.createdAt).toLocaleString()],

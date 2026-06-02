@@ -9,6 +9,8 @@ import type {
   RouteCapabilities,
 } from "bridge-sdk";
 import { recoverWrapTokenRegistration } from "bridge-sdk";
+import { createPublicClient, decodeEventLog, http, parseAbi, type Hash } from "viem";
+import { base as viemBase, baseSepolia as viemBaseSepolia } from "viem/chains";
 import { buildBrowserBridgeClient } from "./bridge";
 import type { EvmConnection, SolanaConnection } from "./wallets/types";
 import type {
@@ -17,11 +19,23 @@ import type {
   WrappedTokenDeploymentRequestDTO,
   WrappedTokenDeploymentResultDTO,
 } from "@/lib/bridge/dto";
+import { BRIDGE_NETWORKS } from "@/lib/bridge/networks";
 import { nativeAsset, routeFor, tokenAsset, wrappedAsset, type BridgeNetwork } from "@/lib/bridge/routes";
 import { isNativeSolSentinel, ensureAssociatedTokenAccount } from "./wallets/ata";
 import { decode, encode } from "@/lib/bridge/serialize";
 
 const STORE_KEY_PREFIX = "bsb.operation.v3";
+const ALLOWANCE_VISIBILITY_TIMEOUT_MS = 30_000;
+const ALLOWANCE_VISIBILITY_POLL_INTERVAL_MS = 1_000;
+
+const ERC20_APPROVAL_ABI = parseAbi([
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function approve(address spender, uint256 amount) returns (bool)",
+]);
+
+const BRIDGE_MESSAGE_ABI = parseAbi([
+  "event MessageInitiated(bytes32 indexed messageHash, bytes32 indexed mmrRoot, (uint64 nonce, address sender, bytes data) message)",
+]);
 
 export interface LogEntry {
   ts: number;
@@ -29,10 +43,29 @@ export interface LogEntry {
   msg: string;
 }
 
+export interface PersistedTransferChunk {
+  index: number;
+  amount: string;
+  messageRef: MessageRef;
+  initiationTx?: string;
+  proofTx?: string;
+  executionTx?: string;
+  executed?: boolean;
+  createdAt: number;
+}
+
+export interface PersistedTransferBatch {
+  totalAmount: string;
+  totalChunks: number;
+  currentIndex: number;
+  chunks: PersistedTransferChunk[];
+}
+
 export interface PersistedOp {
   kind?: "transfer" | "wrap-token";
   messageRef: MessageRef;
   tokenMapping?: TokenMappingInput;
+  transferBatch?: PersistedTransferBatch;
   wrappedTokenDeployment?: {
     baseToken: string;
     mint: string;
@@ -62,6 +95,73 @@ export interface WalletDeps {
 }
 
 type Phase = "idle" | "initiating" | "proving" | "executing";
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function ensureTotalErc20Approval(opts: {
+  deps: WalletDeps;
+  token: `0x${string}`;
+  amount: bigint;
+  addLog: (level: LogEntry["level"], msg: string) => void;
+}): Promise<void> {
+  if (!opts.deps.evm) {
+    throw new Error("Connect MetaMask to approve the Base token.");
+  }
+
+  const chain = opts.deps.network === "testnet" ? viemBaseSepolia : viemBase;
+  const spender = BRIDGE_NETWORKS[opts.deps.network].baseBridgeContract;
+  const publicClient = createPublicClient({
+    chain,
+    transport: http(opts.deps.baseRpc, { retryCount: 0, timeout: 8_000 }),
+  });
+
+  const readAllowance = async () =>
+    await publicClient.readContract({
+      address: opts.token,
+      abi: ERC20_APPROVAL_ABI,
+      functionName: "allowance",
+      args: [opts.deps.evm!.address, spender],
+    });
+
+  const allowance = await readAllowance();
+  if (allowance >= opts.amount) {
+    opts.addLog("info", "Existing ERC20 approval covers the full chunked transfer.");
+    return;
+  }
+
+  opts.addLog("info", "Requesting ERC20 approval for the full chunked transfer...");
+  const { request } = await publicClient.simulateContract({
+    address: opts.token,
+    abi: ERC20_APPROVAL_ABI,
+    functionName: "approve",
+    args: [spender, opts.amount],
+    account: opts.deps.evm.account,
+    chain,
+  });
+  const txHash = await opts.deps.evm.walletClient.writeContract(request);
+  opts.addLog("info", `Approval submitted: ${txHash}`);
+  await publicClient.waitForTransactionReceipt({
+    hash: txHash,
+    confirmations: 1,
+    timeout: 60_000,
+    pollingInterval: 2_000,
+  });
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt <= ALLOWANCE_VISIBILITY_TIMEOUT_MS) {
+    if ((await readAllowance()) >= opts.amount) {
+      opts.addLog("ok", `Approval confirmed: ${txHash}`);
+      return;
+    }
+    await sleep(ALLOWANCE_VISIBILITY_POLL_INTERVAL_MS);
+  }
+
+  throw new Error(
+    `Approval transaction confirmed, but the RPC has not exposed the updated allowance yet. Retry the transfer in a few seconds. txHash=${txHash}`
+  );
+}
 
 function statusLogKey(status: ExecutionStatus): string {
   const executionTx = "executionTx" in status && status.executionTx ? status.executionTx : "";
@@ -122,6 +222,51 @@ function messageRefKey(ref: MessageRef): string {
   ].join(":");
 }
 
+function withCurrentBatchChunk(op: PersistedOp): PersistedOp {
+  const current = op.transferBatch?.chunks[op.transferBatch.currentIndex];
+  if (!current) return op;
+  return {
+    ...op,
+    messageRef: current.messageRef,
+    initiationTx: current.initiationTx,
+  };
+}
+
+function updateCurrentBatchChunk(
+  op: PersistedOp,
+  update: Partial<PersistedTransferChunk>
+): PersistedOp {
+  if (!op.transferBatch) return op;
+  const currentIndex = op.transferBatch.currentIndex;
+  const chunks = op.transferBatch.chunks.map((chunk, index) =>
+    index === currentIndex ? { ...chunk, ...update } : chunk
+  );
+  return withCurrentBatchChunk({
+    ...op,
+    transferBatch: {
+      ...op.transferBatch,
+      chunks,
+    },
+  });
+}
+
+function compactSubmittedBatch(op: PersistedOp): PersistedOp {
+  if (!op.transferBatch) return op;
+  const chunks = op.transferBatch.chunks;
+  if (chunks.length === 0) return op;
+  const totalAmount = chunks.reduce((sum, chunk) => sum + BigInt(chunk.amount), 0n).toString();
+  return withCurrentBatchChunk({
+    ...op,
+    transferBatch: {
+      ...op.transferBatch,
+      totalAmount,
+      totalChunks: chunks.length,
+      currentIndex: Math.min(op.transferBatch.currentIndex, chunks.length - 1),
+      chunks,
+    },
+  });
+}
+
 function loadPersisted(network: BridgeNetwork): PersistedOp | null {
   if (typeof window === "undefined") return null;
   const raw = window.localStorage.getItem(storeKey(network));
@@ -137,6 +282,66 @@ function persist(op: PersistedOp | null, network: BridgeNetwork) {
   if (typeof window === "undefined") return;
   if (op) window.localStorage.setItem(storeKey(network), encode(op));
   else window.localStorage.removeItem(storeKey(network));
+}
+
+async function recoverBaseToSolanaTransferFromTx(opts: {
+  txHash: Hash;
+  deps: WalletDeps;
+}): Promise<PersistedOp> {
+  const route = routeFor("base-to-solana", opts.deps.network);
+  const publicClient = createPublicClient({
+    chain: opts.deps.network === "testnet" ? viemBaseSepolia : viemBase,
+    transport: http(opts.deps.baseRpc, { retryCount: 0, timeout: 10_000 }),
+  });
+  const receipt = await publicClient.getTransactionReceipt({ hash: opts.txHash });
+  if (receipt.status !== "success") {
+    throw new Error(`Base transaction is not successful: ${opts.txHash}`);
+  }
+
+  const bridgeAddress = BRIDGE_NETWORKS[opts.deps.network].baseBridgeContract.toLowerCase();
+  const events = receipt.logs
+    .filter((log) => log.address.toLowerCase() === bridgeAddress)
+    .map((log) => {
+      try {
+        return decodeEventLog({
+          abi: BRIDGE_MESSAGE_ABI,
+          data: log.data,
+          topics: log.topics,
+        });
+      } catch {
+        return null;
+      }
+    })
+    .filter((event): event is NonNullable<typeof event> => event?.eventName === "MessageInitiated");
+
+  if (events.length !== 1) {
+    throw new Error(
+      events.length === 0
+        ? "No Base bridge MessageInitiated event found in that transaction."
+        : `Expected one bridge MessageInitiated event, found ${events.length}.`
+    );
+  }
+
+  const args = events[0].args;
+  return {
+    kind: "transfer",
+    messageRef: {
+      route,
+      source: {
+        chain: route.sourceChain,
+        id: { scheme: "evm:messageHash", value: args.messageHash },
+      },
+      derived: {
+        txHash: receipt.transactionHash,
+        nonce: args.message.nonce.toString(),
+        sender: args.message.sender,
+        data: args.message.data,
+        mmrRoot: args.mmrRoot,
+      },
+    },
+    initiationTx: receipt.transactionHash,
+    createdAt: Date.now(),
+  };
 }
 
 export function useBridgeOperation(deps: WalletDeps) {
@@ -228,10 +433,11 @@ export function useBridgeOperation(deps: WalletDeps) {
   useEffect(() => {
     stopPolling();
     const existing = loadPersisted(deps.network);
-    setOp(existing);
+    const restored = existing ? compactSubmittedBatch(withCurrentBatchChunk(existing)) : null;
+    setOp(restored);
     setStatus(null);
     statusRef.current = null;
-    if (existing) {
+    if (restored) {
       addLog("info", "Restored the saved operation for this environment.");
     }
   }, [addLog, deps.network, stopPolling]);
@@ -278,6 +484,59 @@ export function useBridgeOperation(deps: WalletDeps) {
           );
         }
         if (s.type === "Executed") {
+          if (current.transferBatch) {
+            const executionTx = "executionTx" in s ? s.executionTx : undefined;
+            const executedCurrent = updateCurrentBatchChunk(current, {
+              executed: true,
+              executionTx,
+            });
+            const batch = executedCurrent.transferBatch;
+            const nextIndex = batch
+              ? batch.chunks.findIndex((chunk, index) => index > batch.currentIndex && !chunk.executed)
+              : -1;
+
+            if (batch && nextIndex >= 0) {
+              const advanced = withCurrentBatchChunk({
+                ...executedCurrent,
+                transferBatch: {
+                  ...batch,
+                  currentIndex: nextIndex,
+                },
+              });
+              setOp((prev) =>
+                prev && messageRefKey(prev.messageRef) === messageRefKey(current.messageRef)
+                  ? advanced
+                  : prev
+              );
+              persist(advanced, depsRef.current.network);
+              setStatus(null);
+              statusRef.current = null;
+              addLog("ok", `Chunk ${batch.currentIndex + 1}/${batch.totalChunks} executed on the destination.`);
+              addLog("info", `Tracking chunk ${nextIndex + 1}/${batch.totalChunks}. Prove and execute the next message when it is ready.`);
+              stopPolling();
+              pollRef.current = setInterval(() => void checkStatus(advanced), 8000);
+              return;
+            }
+
+            if (batch) {
+              setOp((prev) =>
+                prev && messageRefKey(prev.messageRef) === messageRefKey(current.messageRef)
+                  ? executedCurrent
+                  : prev
+              );
+              persist(executedCurrent, depsRef.current.network);
+              if (changed) {
+                addLog(
+                  batch.chunks.length === batch.totalChunks ? "ok" : "warn",
+                  batch.chunks.length === batch.totalChunks
+                    ? `Chunk ${batch.currentIndex + 1}/${batch.totalChunks} executed on the destination. All chunks are complete.`
+                    : `Submitted chunks are complete, but only ${batch.chunks.length}/${batch.totalChunks} chunks were submitted. Start another transfer for the remaining amount.`
+                );
+              }
+              stopPolling();
+              return;
+            }
+          }
           if (current.kind === "wrap-token" && current.wrappedTokenDeployment) {
             const updated: PersistedOp = {
               ...current,
@@ -358,6 +617,7 @@ export function useBridgeOperation(deps: WalletDeps) {
       setStatus(null);
       statusRef.current = null;
       addLog("info", `Starting ${req.direction} transfer: amount=${req.amount} recipient=${req.recipient}`);
+      let partialBatchOp: PersistedOp | null = null;
       try {
         const route = routeFor(req.direction, depsRef.current.network);
         const d = depsRef.current;
@@ -394,6 +654,28 @@ export function useBridgeOperation(deps: WalletDeps) {
           );
         }
 
+        const amountChunks = req.amountChunks?.length ? req.amountChunks : [req.amount];
+        const totalAmount = BigInt(req.amount);
+        const chunkTotal = amountChunks.reduce((sum, amount) => sum + BigInt(amount), 0n);
+        if (chunkTotal !== totalAmount) {
+          throw new Error("Transfer chunk plan does not add up to the requested amount.");
+        }
+        if (
+          amountChunks.length > 1 &&
+          req.direction === "base-to-solana" &&
+          req.baseTokenMode === "native-base" &&
+          req.asset.kind === "token" &&
+          req.tokenMapping?.sourceToken
+        ) {
+          addLog("info", `Splitting transfer into ${amountChunks.length} Base bridge transactions to fit the Solana-side uint64 limit.`);
+          await ensureTotalErc20Approval({
+            deps: d,
+            token: req.tokenMapping.sourceToken as `0x${string}`,
+            amount: totalAmount,
+            addLog,
+          });
+        }
+
         const asset =
           req.asset.kind === "token"
             ? tokenAsset(req.asset.address as string)
@@ -401,35 +683,98 @@ export function useBridgeOperation(deps: WalletDeps) {
               ? wrappedAsset(req.asset.address as string)
             : nativeAsset();
         const client = clientFor(route, req.tokenMapping);
-        const operation = await client.transfer({
-          route,
-          asset,
-          amount: BigInt(req.amount),
-          recipient,
-          relay: req.relayMode ? { mode: req.relayMode } : undefined,
-          metadata:
-            req.direction === "base-to-solana"
-              ? {
-                  baseTokenMode: req.baseTokenMode,
-                  baseAmountUnits: req.baseTokenMode === "native-base" ? "local" : "remote",
-                }
-              : undefined,
-        });
-        const next: PersistedOp = {
-          kind: "transfer",
-          messageRef: operation.messageRef,
-          tokenMapping: req.tokenMapping,
-          baseToSolanaRecipient,
-          initiationTx: operation.initiationTx,
-          createdAt: Date.now(),
-        };
+        let next: PersistedOp | null = null;
+
+        for (let index = 0; index < amountChunks.length; index += 1) {
+          const chunkAmount = amountChunks[index]!;
+          if (amountChunks.length > 1) {
+            addLog("info", `Submitting transfer chunk ${index + 1}/${amountChunks.length}: amount=${chunkAmount}`);
+          }
+          const operation = await client.transfer({
+            route,
+            asset,
+            amount: BigInt(chunkAmount),
+            recipient,
+            relay: req.relayMode ? { mode: req.relayMode } : undefined,
+            metadata:
+              req.direction === "base-to-solana"
+                ? {
+                    baseTokenMode: req.baseTokenMode,
+                    baseAmountUnits: req.baseTokenMode === "native-base" ? "local" : "remote",
+                  }
+                : undefined,
+          });
+
+          if (amountChunks.length === 1) {
+            next = {
+              kind: "transfer",
+              messageRef: operation.messageRef,
+              tokenMapping: req.tokenMapping,
+              baseToSolanaRecipient,
+              initiationTx: operation.initiationTx,
+              createdAt: Date.now(),
+            };
+            break;
+          }
+
+          const createdAt = partialBatchOp?.createdAt ?? Date.now();
+          const chunks = [
+            ...(partialBatchOp?.transferBatch?.chunks ?? []),
+            {
+              index,
+              amount: chunkAmount,
+              messageRef: operation.messageRef,
+              initiationTx: operation.initiationTx,
+              createdAt: Date.now(),
+            },
+          ];
+          next = withCurrentBatchChunk({
+            kind: "transfer",
+            messageRef: chunks[0]!.messageRef,
+            tokenMapping: req.tokenMapping,
+            transferBatch: {
+              totalAmount: req.amount,
+              totalChunks: amountChunks.length,
+              currentIndex: partialBatchOp?.transferBatch?.currentIndex ?? 0,
+              chunks,
+            },
+            baseToSolanaRecipient,
+            initiationTx: chunks[0]!.initiationTx,
+            createdAt,
+          });
+          partialBatchOp = next;
+          setOp(next);
+          persist(next, depsRef.current.network);
+          addLog("ok", `Chunk ${index + 1}/${amountChunks.length} Base transaction confirmed: ${operation.initiationTx ?? "(see wallet)"}`);
+        }
+
+        if (!next) {
+          throw new Error("No transfer operation was submitted.");
+        }
         setOp(next);
         persist(next, depsRef.current.network);
-        addLog("ok", `Source transaction confirmed: ${operation.initiationTx ?? "(see wallet)"}`);
+        addLog(
+          "ok",
+          amountChunks.length > 1
+            ? `Submitted ${amountChunks.length}/${amountChunks.length} bridge chunks. Track chunk 1 first.`
+            : `Source transaction confirmed: ${next.initiationTx ?? "(see wallet)"}`
+        );
         startPolling(next);
         void checkStatus(next);
         return next;
       } catch (e) {
+        if (partialBatchOp) {
+          const tracked = compactSubmittedBatch(partialBatchOp);
+          setOp(tracked);
+          persist(tracked, depsRef.current.network);
+          addLog(
+            "warn",
+            `Submitted ${tracked.transferBatch?.chunks.length ?? 0} bridge transaction before the remaining amount hit the current bridge capacity limit. Track the submitted transaction from the operation panel.`
+          );
+          startPolling(tracked);
+          void checkStatus(tracked);
+          return tracked;
+        }
         addLog("error", `Transfer failed: ${(e as Error).message}`);
         throw e;
       } finally {
@@ -562,6 +907,39 @@ export function useBridgeOperation(deps: WalletDeps) {
     [addLog, checkStatus, startPolling, stopPolling]
   );
 
+  const recoverBaseTransfer = useCallback(
+    async (txHash: string) => {
+      const cleanTxHash = txHash.trim();
+      if (!/^0x[0-9a-fA-F]{64}$/.test(cleanTxHash)) {
+        throw new Error("Enter a valid Base transaction hash.");
+      }
+      setIsRecovering(true);
+      setStatus(null);
+      statusRef.current = null;
+      addLog("info", `Recovering Base transfer from tx ${cleanTxHash}...`);
+      try {
+        const next = await recoverBaseToSolanaTransferFromTx({
+          txHash: cleanTxHash as Hash,
+          deps: depsRef.current,
+        });
+        stopPolling();
+        setOp(next);
+        persist(next, depsRef.current.network);
+        addLog("ok", "Recovered Base bridge transfer.");
+        addLog("info", "Resumed tracking the Base-to-Solana message.");
+        startPolling(next);
+        void checkStatus(next);
+        return next;
+      } catch (e) {
+        addLog("error", `Base transfer recovery failed: ${(e as Error).message}`);
+        throw e;
+      } finally {
+        setIsRecovering(false);
+      }
+    },
+    [addLog, checkStatus, startPolling, stopPolling]
+  );
+
   const prove = useCallback(async () => {
     if (!op) return;
     setPhase("proving");
@@ -641,6 +1019,7 @@ export function useBridgeOperation(deps: WalletDeps) {
     transfer,
     deployWrappedToken,
     recoverWrappedTokenRegistration,
+    recoverBaseTransfer,
     prove,
     execute,
     checkStatus,

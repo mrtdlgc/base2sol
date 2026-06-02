@@ -13,7 +13,7 @@ import { WalletBar } from "@/components/WalletBar";
 import { Field, Panel, Segmented } from "@/components/ui";
 
 const B2S_BASE_TOKEN = "0x958e84D234B4D21306A1160693Ff7f8971eDdB07";
-const B2S_SOLANA_MINT = "CgmuqgHUzZsD822L5MBPRyMRqZoEKYwmJyQJtT9tswsX";
+const B2S_SOLANA_MINT = "4Am9L7J3qPX1WbmyrG14Yoh4eueY931NzNgg2s8NGPDg";
 
 function shortAddress(value: string): string {
   return `${value.slice(0, 6)}...${value.slice(-4)}`;
@@ -232,6 +232,7 @@ export function BridgeConsole() {
             onCheck={() => void bridge.checkStatus(undefined, { forceLog: true })}
             onReset={bridge.reset}
             onRecoverRegistration={bridge.recoverWrappedTokenRegistration}
+            onRecoverBaseTransfer={bridge.recoverBaseTransfer}
             recoverBusy={bridge.isRecovering}
           />
         </Panel>

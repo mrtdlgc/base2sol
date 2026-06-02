@@ -1,3 +1,5 @@
+import type { Direction } from "@/lib/bridge/routes";
+
 /**
  * Convenience presets. These are NOT a trusted registry; verify every address
  * on-chain before moving real value. They exist only to make manual testing of
@@ -21,6 +23,8 @@ export interface TokenPreset {
   baseDecimals: number;
   /** Decimals on the Solana side. */
   solanaDecimals: number;
+  /** Optional direction filter when a preset should not be offered both ways. */
+  directions?: Direction[];
 }
 
 /**
@@ -34,9 +38,19 @@ export const TOKEN_PRESETS: TokenPreset[] = [
     baseToSolanaMode: "base-native-erc20",
     solanaToBaseMode: "sol-wrapped-base",
     baseErc20: "0x958e84D234B4D21306A1160693Ff7f8971eDdB07",
+    solanaMint: "4Am9L7J3qPX1WbmyrG14Yoh4eueY931NzNgg2s8NGPDg",
+    baseDecimals: 18,
+    solanaDecimals: 8,
+  },
+  {
+    label: "B2S legacy return (9d)",
+    baseToSolanaMode: "base-native-erc20",
+    solanaToBaseMode: "sol-wrapped-base",
+    baseErc20: "0x958e84D234B4D21306A1160693Ff7f8971eDdB07",
     solanaMint: "CgmuqgHUzZsD822L5MBPRyMRqZoEKYwmJyQJtT9tswsX",
     baseDecimals: 18,
     solanaDecimals: 9,
+    directions: ["solana-to-base"],
   },
   {
     label: "SOL",

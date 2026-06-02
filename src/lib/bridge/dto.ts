@@ -23,6 +23,12 @@ export interface TransferRequestDTO {
    * registered scalar before calling bridgeToken.
    */
   amount: string;
+  /**
+   * Optional source-unit chunks for large Base -> Solana transfers. Each chunk
+   * is submitted as a separate bridge message while `amount` remains the total
+   * user-requested amount.
+   */
+  amountChunks?: string[];
   /** Destination-chain recipient. Base -> Solana may be a wallet owner or token account. */
   recipient: string;
   /** How to interpret a Base -> Solana token source. */
