@@ -233,6 +233,24 @@ function planBaseToSolanaLocalChunks(
   return { chunks: [amountUnits.toString()], remoteTotal, availableRemote };
 }
 
+function remainingSourceCapacityFromLocalDeposit(
+  currentLocalDeposit: bigint,
+  scalar: bigint
+): { availableRemote: bigint; availableSourceUnits: bigint; maxSourceUnits: bigint } {
+  if (scalar <= 0n) {
+    throw new Error("Bridge scalar must be greater than zero.");
+  }
+
+  const maxSourceUnits = MAX_REMOTE_UINT64 * scalar;
+  const availableSourceUnits =
+    currentLocalDeposit >= maxSourceUnits ? 0n : maxSourceUnits - currentLocalDeposit;
+  return {
+    availableRemote: availableSourceUnits / scalar,
+    availableSourceUnits,
+    maxSourceUnits,
+  };
+}
+
 function defaultMode(direction: Direction): AssetMode {
   return direction === "base-to-solana" ? "base-native-erc20" : "sol-native";
 }
@@ -659,6 +677,8 @@ export function AssetForm({
     cleanSourceToken: `0x${string}`,
     cleanDestToken: string
   ): Promise<bigint> {
+    // Base bridge deposits are stored in local Base token units. Convert the
+    // uint64 Solana-side cap into those units before using this value as a limit.
     const remoteToken = bytes32FromSolanaAddress(cleanDestToken);
     const errors: string[] = [];
     for (const rpcUrl of baseMetadataRpcUrls) {
@@ -759,9 +779,9 @@ export function AssetForm({
       try {
         const scalar = BigInt(pairVerification.bridge.scalar);
         const currentDeposit = await readBridgeDeposit(cleanSourceToken as `0x${string}`, cleanDestToken);
-        const availableRemote = currentDeposit >= MAX_REMOTE_UINT64 ? 0n : MAX_REMOTE_UINT64 - currentDeposit;
-        const plan = planBaseToSolanaLocalChunks(amountUnits, scalar, availableRemote);
-        if (plan.remoteTotal > availableRemote) {
+        const capacity = remainingSourceCapacityFromLocalDeposit(currentDeposit, scalar);
+        const plan = planBaseToSolanaLocalChunks(amountUnits, scalar, capacity.availableRemote);
+        if (plan.remoteTotal > capacity.availableRemote) {
           throw new Error("Amount exceeds the Solana mint's remaining bridge capacity.");
         }
       } catch (e) {
@@ -769,9 +789,8 @@ export function AssetForm({
         let capacityMessage = "";
         try {
           const currentDeposit = await readBridgeDeposit(cleanSourceToken as `0x${string}`, cleanDestToken);
-          const availableRemote = currentDeposit >= MAX_REMOTE_UINT64 ? 0n : MAX_REMOTE_UINT64 - currentDeposit;
-          const maxSourceUnits = availableRemote * scalar;
-          capacityMessage = ` Remaining capacity is ${fromBaseUnits(maxSourceUnits, sourceDecimals)} tokens while ${fromBaseUnits(currentDeposit * scalar, sourceDecimals)} tokens are already outstanding on Solana.`;
+          const capacity = remainingSourceCapacityFromLocalDeposit(currentDeposit, scalar);
+          capacityMessage = ` Remaining capacity is ${fromBaseUnits(capacity.availableSourceUnits, sourceDecimals)} tokens while ${fromBaseUnits(currentDeposit, sourceDecimals)} tokens are already outstanding on Solana.`;
         } catch {
           capacityMessage = "";
         }
