@@ -2,10 +2,11 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { address as solanaAddress } from "@solana/kit";
-import { PublicKey } from "@solana/web3.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 import { createPublicClient, http, isAddress as isEvmAddress, parseAbi } from "viem";
 import { base as viemBase, baseSepolia as viemBaseSepolia } from "viem/chains";
 import type {
+  BaseWrappedTokenDeploymentRequestDTO,
   TransferRequestDTO,
   WrappedTokenDeploymentRequestDTO,
 } from "@/lib/bridge/dto";
@@ -13,6 +14,7 @@ import type { BridgeNetwork, Direction } from "@/lib/bridge/routes";
 import { destChainLabel, sourceChainLabel } from "@/lib/bridge/routes";
 import { BASE_ETH_TOKEN_ADDRESS, SOLANA_NATIVE_SOL_SENTINEL } from "@/lib/bridge/constants";
 import { BRIDGE_NETWORKS } from "@/lib/bridge/networks";
+import { bytes32FromSolanaAddress } from "@/lib/bridge/solanaAddress";
 import { TOKEN_PRESETS } from "@/lib/bridge/presets";
 import { verifyTokenPair, type PairVerificationResult } from "@/lib/bridge/pairVerification";
 import { fromBaseUnits, toBaseUnits } from "@/lib/bridge/units";
@@ -27,6 +29,8 @@ type AssetMode =
   | "sol-spl"
   | "sol-wrapped-base";
 
+type ComposeMode = "transfer" | "register-base-token" | "register-solana-token";
+
 interface Props {
   direction: Direction;
   onDirectionChange: (d: Direction) => void;
@@ -35,9 +39,10 @@ interface Props {
   network: BridgeNetwork;
   baseRpc: string;
   solanaRpc: string;
-  onModeChange: (mode: "transfer" | "registration") => void;
+  onModeChange: (mode: ComposeMode) => void;
   onTransfer: (req: TransferRequestDTO) => void;
   onDeployWrappedToken: (req: WrappedTokenDeploymentRequestDTO) => Promise<{ mint: string }>;
+  onDeployBaseWrappedToken: (req: BaseWrappedTokenDeploymentRequestDTO) => Promise<{ baseToken: `0x${string}`; txHash: `0x${string}` }>;
   busy: boolean;
   deployBusy: boolean;
   gated: boolean;
@@ -78,11 +83,28 @@ const MAX_REMOTE_UINT64 = (1n << 64n) - 1n;
 const B2S_BASE_TOKEN = "0x958e84D234B4D21306A1160693Ff7f8971eDdB07";
 const B2S_SOLANA_DECIMALS = 8;
 const DEFAULT_SOLANA_WRAPPED_DECIMALS = 9;
+const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const TOKEN_2022_PROGRAM_ID = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+const MINT_LAYOUT_MIN_LENGTH = 82;
+// Token-2022 stores its extension TLV after the account-type byte at BASE_ACCOUNT_LENGTH.
+const TOKEN_2022_ACCOUNT_TYPE_OFFSET = 165;
+// ExtensionType discriminants (u16 LE) for the mint-level extensions we cannot bridge.
+const EXT_DEFAULT_ACCOUNT_STATE = 6;
+const EXT_NON_TRANSFERABLE = 9;
+const EXT_TRANSFER_HOOK = 14;
 
 interface ChunkPlan {
   chunks: string[];
   remoteTotal: bigint;
   availableRemote: bigint;
+}
+
+interface SolanaMintMetadata {
+  decimals: number;
+  supply: bigint;
+  program: "Token" | "Token-2022";
+  /** Human-readable names of Token-2022 extensions that prevent bridging. */
+  blockingExtensions: string[];
 }
 
 function normalizeRpcUrl(value: string): string {
@@ -111,12 +133,69 @@ function validSolanaAddress(value: string): boolean {
   }
 }
 
-function bytes32FromSolanaAddress(value: string): `0x${string}` {
-  return `0x${Array.from(new PublicKey(value).toBytes(), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+function readU64LE(data: Buffer, offset: number): bigint {
+  let out = 0n;
+  for (let i = 0; i < 8; i += 1) {
+    out |= BigInt(data[offset + i] ?? 0) << BigInt(i * 8);
+  }
+  return out;
+}
+
+/**
+ * Scans a Token-2022 mint's extension TLV for extensions that make the mint
+ * impossible to bridge. The bridge locks tokens with a bare `transfer_checked`
+ * (no hook accounts), so a live transfer hook, the non-transferable extension,
+ * or a frozen-by-default account state would make the vault lock fail on-chain.
+ * Returns human-readable names of any blocking extensions found.
+ */
+function detectBlockingMintExtensions(data: Buffer): string[] {
+  const blocking: string[] = [];
+  if (data.length <= TOKEN_2022_ACCOUNT_TYPE_OFFSET) return blocking;
+
+  // Skip the base mint padding and the account-type byte; TLV entries follow.
+  let offset = TOKEN_2022_ACCOUNT_TYPE_OFFSET + 1;
+  while (offset + 4 <= data.length) {
+    const extType = data[offset] | (data[offset + 1] << 8);
+    const len = data[offset + 2] | (data[offset + 3] << 8);
+    const dataStart = offset + 4;
+    const dataEnd = dataStart + len;
+    if (extType === 0 || dataEnd > data.length) break;
+
+    if (extType === EXT_NON_TRANSFERABLE) {
+      blocking.push("the non-transferable extension");
+    } else if (extType === EXT_TRANSFER_HOOK) {
+      // Layout: authority (32 bytes) then hook program id (32 bytes). The hook
+      // only runs when a program id is actually set (non-zero).
+      const programId = data.subarray(dataStart + 32, dataStart + 64);
+      if (programId.length === 32 && programId.some((byte) => byte !== 0)) {
+        blocking.push("a transfer hook");
+      }
+    } else if (extType === EXT_DEFAULT_ACCOUNT_STATE) {
+      // 1-byte state: 2 = Frozen, which would create the vault account frozen.
+      if (len >= 1 && data[dataStart] === 2) {
+        blocking.push("a frozen-by-default account state");
+      }
+    }
+
+    offset = dataEnd;
+  }
+  return blocking;
 }
 
 function maxHumanSupplyForDecimals(decimals: number): string {
   return fromBaseUnits(MAX_REMOTE_UINT64, decimals);
+}
+
+/**
+ * Solana-side base units needed to represent the whole Base supply for a given
+ * Solana decimals choice. localAmount = remoteAmount * 10^(baseDecimals - solanaDecimals),
+ * so the remote (Solana) amount is the supply divided by that scalar, rounded up.
+ * If this exceeds uint64 the full supply can never be bridged to Solana.
+ */
+function remoteUnitsForSupply(totalSupply: bigint, baseDecimals: number, solanaDecimals: number): bigint {
+  const exponent = baseDecimals - solanaDecimals;
+  const scalar = exponent > 0 ? 10n ** BigInt(exponent) : 1n;
+  return (totalSupply + scalar - 1n) / scalar;
 }
 
 function recommendedSolanaDecimals(baseDecimals: number, totalSupply?: bigint): number {
@@ -168,6 +247,9 @@ function pairTransferBlockReason(
   if (!result.base.ok || !result.solana.ok) {
     return "Token pair verification failed. Fix the Base token and Solana mint before transferring.";
   }
+  if (result.bridge.crossChainErc20 && result.bridge.crossChainRemoteMatches === false) {
+    return "The Base token is a bridge representation of a different Solana mint. Do not transfer.";
+  }
   if (result.bridge.scalarMatchesDecimals === false) {
     return "Bridge scalar does not match the token decimals. Review the pair addresses before transferring.";
   }
@@ -193,6 +275,7 @@ export function AssetForm({
   onModeChange,
   onTransfer,
   onDeployWrappedToken,
+  onDeployBaseWrappedToken,
   busy,
   deployBusy,
   gated,
@@ -208,10 +291,19 @@ export function AssetForm({
   const [recipient, setRecipient] = useState("");
   const [solanaRecipientMode, setSolanaRecipientMode] = useState<"wallet" | "token-account">("wallet");
   const [baseTokenFlow, setBaseTokenFlow] = useState<"existing" | "first-time">("existing");
+  const [solanaTokenFlow, setSolanaTokenFlow] = useState<"existing" | "first-time">("existing");
   const [registrationRelayMode, setRegistrationRelayMode] = useState<"auto" | "manual">("auto");
   const [wrappedName, setWrappedName] = useState("");
   const [wrappedSymbol, setWrappedSymbol] = useState("");
   const [wrappedDecimals, setWrappedDecimals] = useState(9);
+  const [baseWrapperName, setBaseWrapperName] = useState("");
+  const [baseWrapperSymbol, setBaseWrapperSymbol] = useState("");
+  const [baseWrapperDecimals, setBaseWrapperDecimals] = useState(9);
+  // The Solana mint whose on-chain decimals are currently loaded into baseWrapperDecimals.
+  // Null until "Fetch mint details" succeeds; cleared whenever the source mint changes.
+  const [baseWrapperMint, setBaseWrapperMint] = useState<string | null>(null);
+  // Set when the fetched mint uses a Token-2022 extension the bridge cannot handle.
+  const [mintBridgeBlock, setMintBridgeBlock] = useState<string | null>(null);
   const [metadataBusy, setMetadataBusy] = useState(false);
   const [metadataStatus, setMetadataStatus] = useState<MetadataStatus | null>(null);
   const [baseTokenTotalSupply, setBaseTokenTotalSupply] = useState<bigint | null>(null);
@@ -241,6 +333,9 @@ export function AssetForm({
     }
     if (direction !== "base-to-solana" || assetMode !== "base-native-erc20") {
       setBaseTokenFlow("existing");
+    }
+    if (direction !== "solana-to-base" || assetMode !== "sol-spl") {
+      setSolanaTokenFlow("existing");
     }
   }, [assetMode, direction, network, onRelayModeChange, relayMode]);
 
@@ -293,7 +388,8 @@ export function AssetForm({
   const srcLabel = sourceChainLabel(direction);
   const dstLabel = destChainLabel(direction);
   const firstTimeBaseToken = baseToSolana && assetMode === "base-native-erc20" && baseTokenFlow === "first-time";
-  const showTransferFields = !firstTimeBaseToken;
+  const firstTimeSolanaToken = !baseToSolana && assetMode === "sol-spl" && solanaTokenFlow === "first-time";
+  const showTransferFields = !firstTimeBaseToken && !firstTimeSolanaToken;
   const requiresSourceToken =
     assetMode === "base-native-erc20" ||
     assetMode === "base-wrapped-solana" ||
@@ -301,6 +397,7 @@ export function AssetForm({
     assetMode === "sol-wrapped-base";
   const requiresDestToken =
     !firstTimeBaseToken &&
+    !firstTimeSolanaToken &&
     (assetMode === "base-native-erc20" ||
       assetMode === "base-native-eth" ||
       assetMode === "base-wrapped-solana" ||
@@ -308,9 +405,12 @@ export function AssetForm({
   const remoteIsNativeSol = baseToSolana && destToken.trim() === SOLANA_NATIVE_SOL_SENTINEL;
   const relayAutoSupported = direction === "solana-to-base";
   const canDeployWrappedMint = firstTimeBaseToken;
+  const canDeployBaseWrappedToken = firstTimeSolanaToken;
   const canFetchBaseTokenMetadata = baseTokenContractMode;
+  const canFetchSolanaMintMetadata = !baseToSolana && assetMode === "sol-spl";
   const canVerifyTokenPair =
     !firstTimeBaseToken &&
+    !firstTimeSolanaToken &&
     ((baseToSolana &&
       (assetMode === "base-native-erc20" || assetMode === "base-wrapped-solana")) ||
       (!baseToSolana &&
@@ -330,23 +430,53 @@ export function AssetForm({
   const isB2SRegistration =
     firstTimeBaseToken && sourceToken.trim().toLowerCase() === B2S_BASE_TOKEN.toLowerCase();
   const solanaMintCapacity = maxHumanSupplyForDecimals(wrappedDecimals);
-  const registrationCapacityIssue =
-    isB2SRegistration && wrappedDecimals > B2S_SOLANA_DECIMALS
-      ? "Set Solana decimals to 8 for B2S. 9 decimals cannot hold the intended 50B Solana-side supply."
+  // Whole-supply Solana capacity at the chosen decimals. High-supply 18-decimal Base
+  // tokens (e.g. Clanker/Bankr at 100B) overflow uint64 unless decimals are lowered.
+  const registrationRemoteUnits =
+    firstTimeBaseToken && baseTokenTotalSupply !== null && wrappedDecimals <= decimals
+      ? remoteUnitsForSupply(baseTokenTotalSupply, decimals, wrappedDecimals)
       : null;
+  const registrationCapacityIssue =
+    registrationRemoteUnits !== null && registrationRemoteUnits > MAX_REMOTE_UINT64
+      ? `At ${wrappedDecimals} Solana decimals, this token's ${fromBaseUnits(baseTokenTotalSupply!, decimals)} supply needs more than uint64 base units on Solana, so it cannot be fully bridged. Lower Solana decimals to ${recommendedSolanaDecimals(decimals, baseTokenTotalSupply!)} so the entire supply fits.`
+      : isB2SRegistration && wrappedDecimals > B2S_SOLANA_DECIMALS
+        ? "Set Solana decimals to 8 for B2S. 9 decimals cannot hold the intended 50B Solana-side supply."
+        : null;
+  // The Base ERC20 mirrors the Solana mint 1:1, so its decimals must match the mint
+  // exactly. Require a successful fetch of the current mint before allowing deploy.
+  const baseWrapperReady =
+    canDeployBaseWrappedToken &&
+    mintBridgeBlock === null &&
+    baseWrapperMint !== null &&
+    baseWrapperMint === sourceToken.trim();
+  const baseWrapperGateReason = deployGated
+    ? deployGateReason
+    : mintBridgeBlock
+      ? mintBridgeBlock
+      : !baseWrapperReady
+        ? 'Click "Fetch mint details" to read the mint decimals before deploying.'
+        : undefined;
 
   useEffect(() => {
-    onModeChange(firstTimeBaseToken ? "registration" : "transfer");
-  }, [firstTimeBaseToken, onModeChange]);
+    onModeChange(
+      firstTimeBaseToken
+        ? "register-base-token"
+        : firstTimeSolanaToken
+          ? "register-solana-token"
+          : "transfer"
+    );
+  }, [firstTimeBaseToken, firstTimeSolanaToken, onModeChange]);
 
   useEffect(() => {
     pairVerificationRunRef.current += 1;
     setPairVerification(null);
     setPairBusy(false);
-  }, [assetMode, direction, network, sourceToken, destToken]);
+  }, [assetMode, direction, network, sourceToken, destToken, baseTokenFlow, solanaTokenFlow]);
 
   useEffect(() => {
     setBaseTokenTotalSupply(null);
+    setBaseWrapperMint(null);
+    setMintBridgeBlock(null);
   }, [sourceToken]);
 
   const assetOptions: { value: AssetMode; label: string }[] = baseToSolana
@@ -372,6 +502,7 @@ export function AssetForm({
       setDecimals(p.baseDecimals);
       setSolanaRecipientMode("wallet");
     } else {
+      setSolanaTokenFlow("existing");
       setSourceToken(p.solanaMint);
       setDestToken(p.baseErc20);
       setDecimals(p.solanaDecimals);
@@ -486,6 +617,42 @@ export function AssetForm({
       }
     }
     throw new Error(errors.join(" | ") || "No Base RPC URL is configured.");
+  }
+
+  async function readSolanaMintMetadata(cleanMint: string): Promise<SolanaMintMetadata> {
+    let pubkey: PublicKey;
+    try {
+      pubkey = new PublicKey(cleanMint);
+    } catch {
+      throw new Error("Enter a valid Solana mint address.");
+    }
+
+    const connection = new Connection(solanaRpc, "confirmed");
+    const account = await connection.getAccountInfo(pubkey, "confirmed");
+    if (!account) {
+      throw new Error("Solana mint account was not found.");
+    }
+
+    let program: SolanaMintMetadata["program"];
+    if (account.owner.equals(TOKEN_PROGRAM_ID)) {
+      program = "Token";
+    } else if (account.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+      program = "Token-2022";
+    } else {
+      throw new Error(`Account is owned by ${account.owner.toBase58()}, not a Solana token program.`);
+    }
+
+    if (account.data.length < MINT_LAYOUT_MIN_LENGTH) {
+      throw new Error(`Mint account data is too short (${account.data.length} bytes).`);
+    }
+
+    return {
+      decimals: account.data[44],
+      supply: readU64LE(account.data, 36),
+      program,
+      blockingExtensions:
+        program === "Token-2022" ? detectBlockingMintExtensions(account.data) : [],
+    };
   }
 
   async function readBridgeDeposit(
@@ -681,6 +848,40 @@ export function AssetForm({
       return;
     }
 
+    // Validate against on-chain truth before signing: the bridge scalar is derived
+    // from the Base token's real decimals, and the whole supply must fit in uint64 at
+    // the chosen Solana decimals or part of it could never be bridged. High-supply,
+    // 18-decimal Base tokens (e.g. Clanker/Bankr at 100B) overflow uint64 at 9 decimals.
+    setMetadataBusy(true);
+    let onChain: BaseTokenMetadata | null = null;
+    try {
+      onChain = await readBaseTokenMetadata(cleanSourceToken as `0x${string}`);
+    } catch (e) {
+      setFormError(`Could not read Base token metadata to validate the registration: ${(e as Error).message}`);
+    } finally {
+      setMetadataBusy(false);
+    }
+    if (!onChain) return;
+
+    if (onChain.decimals !== decimals) {
+      setDecimals(onChain.decimals);
+      setBaseTokenTotalSupply(onChain.totalSupply ?? null);
+      setWrappedDecimals(recommendedSolanaDecimals(onChain.decimals, onChain.totalSupply));
+      setFormError(`This Base token reports ${onChain.decimals} decimals on-chain (the form had ${decimals}). Updated the decimals and recommended Solana decimals; review and retry.`);
+      return;
+    }
+    if (onChain.totalSupply) {
+      setBaseTokenTotalSupply(onChain.totalSupply);
+      const remoteUnits = remoteUnitsForSupply(onChain.totalSupply, onChain.decimals, wrappedDecimals);
+      if (remoteUnits > MAX_REMOTE_UINT64) {
+        const recommended = recommendedSolanaDecimals(onChain.decimals, onChain.totalSupply);
+        setFormError(
+          `At ${wrappedDecimals} Solana decimals, the full supply (${fromBaseUnits(onChain.totalSupply, onChain.decimals)} tokens) needs more than uint64 base units on Solana, so part of it could never be bridged. Lower Solana decimals to ${recommended}.`
+        );
+        return;
+      }
+    }
+
     try {
       const result = await onDeployWrappedToken({
         baseToken: cleanSourceToken,
@@ -695,6 +896,113 @@ export function AssetForm({
       setBaseTokenFlow("existing");
     } catch (e) {
       setFormError((e as Error).message);
+    }
+  }
+
+  async function deployBaseWrappedToken() {
+    setFormError(null);
+    setFormNotice(null);
+    setMetadataStatus(null);
+    const cleanSourceToken = sourceToken.trim();
+    const cleanName = baseWrapperName.trim();
+    const cleanSymbol = baseWrapperSymbol.trim();
+
+    if (!validSolanaAddress(cleanSourceToken)) {
+      setFormError("Enter a valid Solana mint address for the source token.");
+      return;
+    }
+    if (!cleanName) {
+      setFormError("Enter the Base token name.");
+      return;
+    }
+    if (!cleanSymbol) {
+      setFormError("Enter the Base token symbol.");
+      return;
+    }
+
+    // Re-read the mint right before deploying so the Base ERC20 always mirrors the
+    // mint's real decimals. The factory route mints 1:1 with no scalar, so any
+    // decimals mismatch would permanently misscale every bridged amount.
+    let confirmed: SolanaMintMetadata | null = null;
+    setMetadataBusy(true);
+    try {
+      confirmed = await readSolanaMintMetadata(cleanSourceToken);
+    } catch (e) {
+      setFormError(`Could not confirm the Solana mint decimals before deploying: ${(e as Error).message}`);
+    } finally {
+      setMetadataBusy(false);
+    }
+    if (!confirmed) return;
+    if (confirmed.blockingExtensions.length > 0) {
+      const reason = `This ${confirmed.program} mint uses ${confirmed.blockingExtensions.join(" and ")}, which base2sol cannot bridge. Locking it into the bridge vault would fail on-chain, so it is not bridgeable.`;
+      setBaseWrapperMint(null);
+      setMintBridgeBlock(reason);
+      setFormError(reason);
+      return;
+    }
+    const onChainDecimals = confirmed.decimals;
+    setDecimals(onChainDecimals);
+    setBaseWrapperDecimals(onChainDecimals);
+    setBaseWrapperMint(cleanSourceToken);
+    setMintBridgeBlock(null);
+
+    try {
+      const result = await onDeployBaseWrappedToken({
+        solanaMint: cleanSourceToken,
+        name: cleanName,
+        symbol: cleanSymbol,
+        decimals: onChainDecimals,
+      });
+      setDestToken(result.baseToken);
+      setDecimals(onChainDecimals);
+      setSolanaTokenFlow("existing");
+      setFormNotice(`Created Base ERC20 ${result.baseToken} with ${onChainDecimals} decimals to match the Solana mint. You can now verify the pair and start a Solana -> Base transfer.`);
+    } catch (e) {
+      setFormError((e as Error).message);
+    }
+  }
+
+  async function loadSolanaMintMetadata() {
+    setFormError(null);
+    setFormNotice("Fetching Solana mint metadata...");
+    setMetadataStatus({ tone: "info", text: "Fetching Solana mint metadata..." });
+    const cleanSourceToken = sourceToken.trim();
+    if (!validSolanaAddress(cleanSourceToken)) {
+      setFormError("Enter a valid Solana mint address first.");
+      setFormNotice(null);
+      setMetadataStatus({ tone: "error", text: "Enter a valid Solana mint address first." });
+      return;
+    }
+    setMetadataBusy(true);
+    try {
+      const metadata = await readSolanaMintMetadata(cleanSourceToken);
+      setDecimals(metadata.decimals);
+      setBaseWrapperDecimals(metadata.decimals);
+      const supplyText = fromBaseUnits(metadata.supply, metadata.decimals);
+      if (metadata.blockingExtensions.length > 0) {
+        const reason = `This ${metadata.program} mint uses ${metadata.blockingExtensions.join(" and ")}, which base2sol cannot bridge. Locking it into the bridge vault would fail on-chain, so it is not bridgeable.`;
+        setBaseWrapperMint(null);
+        setMintBridgeBlock(reason);
+        setFormError(reason);
+        setFormNotice(null);
+        setMetadataStatus({ tone: "error", text: reason });
+        return;
+      }
+      setBaseWrapperMint(cleanSourceToken);
+      setMintBridgeBlock(null);
+      setFormNotice(
+        `Fetched ${metadata.program} mint: decimals ${metadata.decimals}; supply ${supplyText}.`
+      );
+      setMetadataStatus({
+        tone: "success",
+        text: `Fetched ${metadata.program} mint: decimals ${metadata.decimals}; supply ${supplyText}.`,
+      });
+    } catch (e) {
+      setFormError(`Could not fetch Solana mint metadata: ${(e as Error).message}`);
+      setFormNotice(null);
+      setMetadataStatus({ tone: "error", text: `Mint fetch failed: ${shortRpcError(e)}` });
+    } finally {
+      setMetadataBusy(false);
     }
   }
 
@@ -789,6 +1097,13 @@ export function AssetForm({
   }
 
   function bridgePairLabel(result: PairVerificationResult): string {
+    if (result.bridge.crossChainErc20) {
+      if (result.bridge.crossChainRemoteMatches === true)
+        return "CrossChainERC20 mapped to this mint - mints 1:1, no scalar needed";
+      if (result.bridge.crossChainRemoteMatches === false)
+        return "CrossChainERC20 maps to a DIFFERENT mint - do not transfer";
+      return "CrossChainERC20 - remote mint unconfirmed, retry verification";
+    }
     if (!result.bridge.checked) return result.bridge.error ?? "Bridge registration was not checked.";
     if (result.bridge.registered) {
       const expected =
@@ -850,7 +1165,27 @@ export function AssetForm({
         </Field>
       )}
 
-      {!firstTimeBaseToken && presets.length > 0 && (
+      {!baseToSolana && assetMode === "sol-spl" && (
+        <Field
+          label="Token status"
+          hint={
+            solanaTokenFlow === "first-time"
+              ? "Create the Base ERC20 representation first, then use it as the destination token."
+              : "Use this when you already know the Base ERC20 representation for this Solana mint."
+          }
+        >
+          <Segmented<"existing" | "first-time">
+            value={solanaTokenFlow}
+            onChange={setSolanaTokenFlow}
+            options={[
+              { value: "existing", label: "Use existing ERC20" },
+              { value: "first-time", label: "Create Base ERC20" },
+            ]}
+          />
+        </Field>
+      )}
+
+      {!firstTimeBaseToken && !firstTimeSolanaToken && presets.length > 0 && (
         <Field label="Known pair" hint="Convenience only. Verify addresses before moving value.">
           <select defaultValue="" onChange={(e) => e.target.value && applyPreset(e.target.value)}>
             <option value="">Select a known pair...</option>
@@ -872,7 +1207,13 @@ export function AssetForm({
                 : "Base token contract"
               : "Solana mint address"
           }
-          hint={canDeployWrappedMint ? "This is the ERC20 contract teams want to make bridgeable to Solana." : undefined}
+          hint={
+            canDeployWrappedMint
+              ? "This is the ERC20 contract teams want to make bridgeable to Solana."
+              : canDeployBaseWrappedToken
+                ? "This is the Solana mint teams want to make bridgeable to Base."
+                : undefined
+          }
         >
           <input
             value={sourceToken}
@@ -890,6 +1231,26 @@ export function AssetForm({
                 {metadataBusy ? "Loading..." : "Fetch ERC20 metadata"}
               </button>
               {metadataStatus && (
+                <span
+                  className={`hint ${metadataStatus.tone === "success" ? "" : metadataStatus.tone}`}
+                  style={{ flex: "1 1 180px" }}
+                >
+                  {metadataStatus.text}
+                </span>
+              )}
+            </div>
+          )}
+          {canFetchSolanaMintMetadata && (
+            <div className="row" style={{ marginTop: 8 }}>
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={metadataBusy}
+                onClick={() => void loadSolanaMintMetadata()}
+              >
+                {metadataBusy ? "Loading..." : "Fetch mint details"}
+              </button>
+              {metadataStatus && !canFetchBaseTokenMetadata && (
                 <span
                   className={`hint ${metadataStatus.tone === "success" ? "" : metadataStatus.tone}`}
                   style={{ flex: "1 1 180px" }}
@@ -1063,14 +1424,69 @@ export function AssetForm({
             <button
               type="button"
               className="btn solana"
-              disabled={deployBusy || busy || deployGated || !!registrationCapacityIssue}
+              disabled={deployBusy || busy || metadataBusy || deployGated || !!registrationCapacityIssue}
               onClick={() => void deployWrappedMint()}
             >
-              {deployBusy ? "Creating mint..." : "Create mint & register"}
+              {deployBusy ? "Creating mint..." : metadataBusy ? "Checking supply..." : "Create mint & register"}
             </button>
             {deployGated && (
               <span className="hint warn">
                 {deployGateReason}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {canDeployBaseWrappedToken && (
+        <div className="notice" style={{ marginTop: 0, marginBottom: 12 }}>
+          <div className="notice-title">Register this Solana token on Base</div>
+          <div className="hint" style={{ marginBottom: 12 }}>
+            base2sol deploys a bridge-owned CrossChainERC20 on Base for this Solana mint. After deployment, use the new Base token contract in the transfer flow.
+          </div>
+          <Field label="Base token name">
+            <input
+              value={baseWrapperName}
+              onChange={(e) => setBaseWrapperName(e.target.value)}
+              placeholder="Example Token"
+            />
+          </Field>
+          <div className="row">
+            <div style={{ flex: 1, minWidth: 120 }}>
+              <Field label="Symbol">
+                <input
+                  value={baseWrapperSymbol}
+                  onChange={(e) => setBaseWrapperSymbol(e.target.value)}
+                  placeholder="EXMPL"
+                />
+              </Field>
+            </div>
+            <div style={{ flex: 1, minWidth: 120 }}>
+              <Field
+                label="Solana decimals"
+                hint="Read from the mint. The Base ERC20 mirrors these decimals exactly."
+              >
+                <input
+                  type="number"
+                  value={baseWrapperReady ? baseWrapperDecimals : ""}
+                  readOnly
+                  placeholder="Fetch mint details"
+                />
+              </Field>
+            </div>
+          </div>
+          <div className="row">
+            <button
+              type="button"
+              className="btn"
+              disabled={deployBusy || busy || metadataBusy || deployGated || !baseWrapperReady}
+              onClick={() => void deployBaseWrappedToken()}
+            >
+              {deployBusy ? "Creating ERC20..." : "Create Base ERC20"}
+            </button>
+            {baseWrapperGateReason && (
+              <span className="hint warn">
+                {baseWrapperGateReason}
               </span>
             )}
           </div>

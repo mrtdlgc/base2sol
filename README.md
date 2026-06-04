@@ -6,6 +6,8 @@ Base <-> Solana route.
 It is built for token teams and power users who need to:
 
 - register a Base ERC20 as a Solana Token-2022 mint for the first time;
+- register a Solana SPL or Token-2022 mint as a Base CrossChainERC20 for the
+  first time;
 - bridge registered Base assets to Solana;
 - bridge Solana assets or wrapped Base assets back to Base;
 - resume pending bridge operations from the browser.
@@ -25,6 +27,7 @@ Start here:
 - [What is base2sol?](docs/product/what-is-base2sol.md)
 - [How the bridge works](docs/product/how-it-works.md)
 - [Register a Base token on Solana](docs/guides/register-a-base-token.md)
+- [Register a Solana token on Base](docs/guides/register-a-solana-token.md)
 - [Bridge Base to Solana](docs/guides/bridge-base-to-solana.md)
 - [Bridge Solana to Base](docs/guides/bridge-solana-to-base.md)
 - [Request a known pair](docs/guides/request-known-pair.md)

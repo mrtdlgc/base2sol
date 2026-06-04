@@ -50,6 +50,12 @@ export const docsPages: DocsPage[] = [
   ),
   page(
     "Guides",
+    "Register a Solana token",
+    "Deploy a Base CrossChainERC20 representation for a Solana mint, then bridge.",
+    "guides/register-a-solana-token"
+  ),
+  page(
+    "Guides",
     "Bridge Base to Solana",
     "Approve, bridge on Base, wait for checkpoint state, prove, and execute on Solana.",
     "guides/bridge-base-to-solana"

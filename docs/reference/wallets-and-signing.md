@@ -14,6 +14,7 @@ base2sol signs entirely in the browser.
 | Flow | Initiate | Prove | Execute |
 | --- | --- | --- | --- |
 | Register Base token on Solana | Phantom | Not user-facing | MetaMask if manual execution is selected |
+| Register Solana token on Base | MetaMask | Not applicable | Not applicable |
 | Base -> Solana | MetaMask | Phantom | Phantom |
 | Solana -> Base with auto-relay | Phantom | Not applicable | Protocol relayer |
 | Solana -> Base with manual execution | Phantom | Not applicable | MetaMask |

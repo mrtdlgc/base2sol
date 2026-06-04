@@ -4,16 +4,17 @@ base2sol is a frontend for the Base <-> Solana bridge route powered by the
 Base Bridge SDK.
 
 The product exists because a generic bridge screen is not enough for token
-teams. A team that has deployed an ERC20 on Base needs a clean way to create the
-Solana representation first. Once that representation exists, users need a clear
-bridge interface for moving the token in both directions.
+teams. A team that has deployed a token on Base or Solana needs a clean way to
+create the opposite-chain representation first. Once that representation
+exists, users need a clear bridge interface for moving the token in both
+directions.
 
 base2sol combines those two jobs in one app.
 
 ## The main value proposition
 
-base2sol lets a team make a Base token bridgeable to Solana without asking users
-to manually understand bridge internals.
+base2sol lets a team make a Base token bridgeable to Solana, or a Solana token
+bridgeable to Base, without asking users to manually understand bridge internals.
 
 For a first-time Base token, the app:
 
@@ -24,6 +25,16 @@ For a first-time Base token, the app:
 5. fills the new Solana mint into the transfer form.
 
 After that, users can bridge the token from Base to Solana and back.
+
+For a first-time Solana token, the app:
+
+1. takes the Solana mint address;
+2. fetches the mint decimals from Solana;
+3. deploys a Base CrossChainERC20 representation through the Base bridge
+   factory;
+4. fills the new Base contract into the transfer form.
+
+After that, users can bridge the token from Solana to Base and back.
 
 ## What base2sol is
 
@@ -44,9 +55,10 @@ After that, users can bridge the token from Base to Solana and back.
 ## Why first-time registration matters
 
 Bridge transfers require a known mapping between the token on the source chain
-and the representation on the destination chain. For a Base ERC20 that has never
-been bridged to Solana, that mapping does not exist yet.
+and the representation on the destination chain. For a token that has never
+been bridged in the selected direction, that representation does not exist yet.
 
-The registration flow is the setup step. It creates the Solana mint and tells
-Base about the new representation. Only after that message executes can normal
-Base -> Solana transfers use the mint.
+The registration flow is the setup step. Base-origin tokens create a Solana mint
+and register that mint back on Base. Solana-origin tokens deploy a Base
+CrossChainERC20 representation. Only after the destination representation exists
+can normal transfers use the pair.

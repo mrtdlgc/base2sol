@@ -7,6 +7,7 @@ Use this guide when the source asset is on Solana and the destination is Base.
 - Phantom connected to Solana mainnet-beta or devnet.
 - Enough SOL for transaction fees.
 - A Base recipient address.
+- A Base CrossChainERC20 representation for SPL or Token-2022 transfers.
 - MetaMask if you choose manual execution on Base.
 
 ## Step 1: Select the route
@@ -24,6 +25,9 @@ For SPL or Token-2022 transfers, enter:
 
 - the Solana mint address;
 - the mapped Base token contract.
+
+If the Solana mint has never been registered on Base, complete
+[Register a Solana token on Base](register-a-solana-token.md) first.
 
 For `Base token on Solana`, enter the Solana wrapped mint that represents the
 Base token.

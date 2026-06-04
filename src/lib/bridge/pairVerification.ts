@@ -16,6 +16,18 @@ const BRIDGE_SCALAR_ABI = parseAbi([
   "function scalars(address localToken, bytes32 remoteToken) view returns (uint256)",
 ]);
 
+const BRIDGE_FACTORY_ABI = parseAbi([
+  "function CROSS_CHAIN_ERC20_FACTORY() view returns (address)",
+]);
+
+const FACTORY_ABI = parseAbi([
+  "function isCrossChainErc20(address token) view returns (bool)",
+]);
+
+const CROSS_CHAIN_ERC20_ABI = parseAbi([
+  "function remoteToken() view returns (bytes32)",
+]);
+
 const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const TOKEN_2022_PROGRAM_ID = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 const BASE_MAINNET_RPC_FALLBACKS = ["https://base-rpc.publicnode.com", "https://1rpc.io/base"];
@@ -58,6 +70,10 @@ export interface PairVerificationResult {
     scalar?: string;
     expectedScalar?: string;
     scalarMatchesDecimals?: boolean;
+    /** True when the Base token is a factory-deployed CrossChainERC20 (Solana-native asset). */
+    crossChainErc20?: boolean;
+    /** True when that CrossChainERC20's remoteToken equals the entered Solana mint. */
+    crossChainRemoteMatches?: boolean;
     error?: string;
   };
   summary: {
@@ -243,6 +259,7 @@ async function readBridgeScalar(
   }
 
   const errors: string[] = [];
+  const remoteTokenHex = bytes32FromSolanaAddress(input.solanaMint);
   for (const rpcUrl of rpcCandidates(input.network, input.baseRpc)) {
     const client = basePublicClient(input.network, rpcUrl);
     try {
@@ -250,14 +267,47 @@ async function readBridgeScalar(
         address: BRIDGE_NETWORKS[input.network].baseBridgeContract,
         abi: BRIDGE_SCALAR_ABI,
         functionName: "scalars",
-        args: [input.baseToken as `0x${string}`, bytes32FromSolanaAddress(input.solanaMint)],
+        args: [input.baseToken as `0x${string}`, remoteTokenHex],
       });
+
+      // Best-effort: is the Base token a bridge-deployed CrossChainERC20 (i.e. a
+      // Solana-native asset that mints 1:1, no scalar), and does its remoteToken
+      // match this mint? Failures here leave the fields undefined, not false.
+      let crossChainErc20: boolean | undefined;
+      let crossChainRemoteMatches: boolean | undefined;
+      try {
+        const factory = await client.readContract({
+          address: BRIDGE_NETWORKS[input.network].baseBridgeContract,
+          abi: BRIDGE_FACTORY_ABI,
+          functionName: "CROSS_CHAIN_ERC20_FACTORY",
+        });
+        crossChainErc20 = await client.readContract({
+          address: factory,
+          abi: FACTORY_ABI,
+          functionName: "isCrossChainErc20",
+          args: [input.baseToken as `0x${string}`],
+        });
+        if (crossChainErc20) {
+          const remoteToken = await client.readContract({
+            address: input.baseToken as `0x${string}`,
+            abi: CROSS_CHAIN_ERC20_ABI,
+            functionName: "remoteToken",
+          });
+          crossChainRemoteMatches =
+            (remoteToken as string).toLowerCase() === remoteTokenHex.toLowerCase();
+        }
+      } catch {
+        // leave the cross-chain fields undefined when the reads cannot complete
+      }
+
       const scalarText = scalar.toString();
       return {
         checked: true,
         scalarRequired: input.scalarRequired,
         registered: scalar > 0n,
         scalar: scalarText,
+        crossChainErc20,
+        crossChainRemoteMatches,
       };
     } catch (e) {
       errors.push(`${rpcUrl}: ${shortError(e)}`);
@@ -288,6 +338,30 @@ function summarize(result: Omit<PairVerificationResult, "summary">): PairVerific
       tone: "error",
       title: "Token metadata check failed",
       detail: "Fix the Base token or Solana mint address before signing.",
+    };
+  }
+
+  // A bridge-deployed CrossChainERC20 represents a Solana-native asset and mints 1:1,
+  // so it never has a scalar. Confirm its remoteToken points at this exact mint.
+  if (result.bridge.crossChainErc20) {
+    if (result.bridge.crossChainRemoteMatches === true) {
+      return {
+        tone: "success",
+        title: "Base token is a bridge representation of this Solana mint",
+        detail: "The Base ERC20 is a CrossChainERC20 mapped to this exact mint. No scalar is used; the bridge mints 1:1.",
+      };
+    }
+    if (result.bridge.crossChainRemoteMatches === false) {
+      return {
+        tone: "error",
+        title: "Base token maps to a different Solana mint",
+        detail: "This CrossChainERC20's remote token does not match the entered Solana mint. Do not transfer.",
+      };
+    }
+    return {
+      tone: "warn",
+      title: "Base token is a CrossChainERC20, remote mint unconfirmed",
+      detail: "Could not read the representation's remote token from this RPC. Retry verification before transferring.",
     };
   }
 
@@ -344,8 +418,12 @@ export async function verifyTokenPair(input: PairVerificationInput): Promise<Pai
   const bridgeWithExpected = {
     ...bridge,
     expectedScalar: expected,
+    // Only meaningful when a scalar is actually registered; an unregistered route
+    // reports scalar "0", which must not be compared against the decimal-derived value.
     scalarMatchesDecimals:
-      bridge.scalar && expected ? bridge.scalar === expected : undefined,
+      bridge.registered && bridge.scalar && expected
+        ? bridge.scalar === expected
+        : undefined,
   };
   const result = {
     checkedAt: Date.now(),

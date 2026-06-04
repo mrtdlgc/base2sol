@@ -15,6 +15,8 @@ import { Field, Panel, Segmented } from "@/components/ui";
 const B2S_BASE_TOKEN = "0x958e84D234B4D21306A1160693Ff7f8971eDdB07";
 const B2S_SOLANA_MINT = "4Am9L7J3qPX1WbmyrG14Yoh4eueY931NzNgg2s8NGPDg";
 
+type ComposeMode = "transfer" | "register-base-token" | "register-solana-token";
+
 function shortAddress(value: string): string {
   return `${value.slice(0, 6)}...${value.slice(-4)}`;
 }
@@ -22,7 +24,7 @@ function shortAddress(value: string): string {
 export function BridgeConsole() {
   const [network, setNetwork] = useState<BridgeNetwork>(defaultNetwork());
   const [direction, setDirection] = useState<Direction>("base-to-solana");
-  const [composeMode, setComposeMode] = useState<"transfer" | "registration">("transfer");
+  const [composeMode, setComposeMode] = useState<ComposeMode>("transfer");
   const [relayMode, setRelayMode] = useState<"auto" | "manual">("manual");
   const [baseRpc, setBaseRpc] = useState(BRIDGE_NETWORKS[network].baseRpcUrl);
   const [solanaRpc, setSolanaRpc] = useState(BRIDGE_NETWORKS[network].solanaRpcUrl);
@@ -49,8 +51,11 @@ export function BridgeConsole() {
   }
 
   const initiateRequirements = useMemo(() => {
-    if (composeMode === "registration") {
+    if (composeMode === "register-base-token") {
       return { evmRequired: false, solanaRequired: true };
+    }
+    if (composeMode === "register-solana-token") {
+      return { evmRequired: true, solanaRequired: false };
     }
     if (direction === "base-to-solana") {
       return { evmRequired: true, solanaRequired: true };
@@ -74,6 +79,14 @@ export function BridgeConsole() {
     : missing.length > 0
       ? `Connect ${missing.join(" + ")} to continue.`
       : undefined;
+  const deployGated = activeOperationBlocksInitiate || (composeMode === "register-solana-token" ? !wallets.evm : !wallets.solana);
+  const deployGateReason = activeOperationBlocksInitiate
+    ? gateReason
+    : composeMode === "register-solana-token" && !wallets.evm
+      ? "Connect MetaMask to create the Base ERC20."
+      : composeMode !== "register-solana-token" && !wallets.solana
+        ? "Connect Phantom to create the Solana mint."
+        : undefined;
 
   const manualActionState = useMemo(() => {
     if (!bridge.op) {
@@ -207,12 +220,13 @@ export function BridgeConsole() {
             onModeChange={setComposeMode}
             onTransfer={(req) => void bridge.transfer(req)}
             onDeployWrappedToken={bridge.deployWrappedToken}
+            onDeployBaseWrappedToken={bridge.deployBaseWrappedToken}
             busy={bridge.phase === "initiating" && bridge.initiatingKind === "transfer"}
-            deployBusy={bridge.phase === "initiating" && bridge.initiatingKind === "wrap-token"}
+            deployBusy={bridge.phase === "initiating" && (bridge.initiatingKind === "wrap-token" || bridge.initiatingKind === "base-wrapper")}
             gated={gated}
             gateReason={gateReason}
-            deployGated={!wallets.solana || activeOperationBlocksInitiate}
-            deployGateReason={!wallets.solana ? "Connect Phantom to create the Solana mint." : activeOperationBlocksInitiate ? gateReason : undefined}
+            deployGated={deployGated}
+            deployGateReason={deployGateReason}
           />
         </Panel>
 

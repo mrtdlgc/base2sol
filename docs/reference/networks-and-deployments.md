@@ -18,10 +18,13 @@ base2sol uses the bridge deployments bundled in the vendored SDK.
 
 ## Base bridge contracts
 
-| Environment | Bridge contract |
-| --- | --- |
-| Mainnet | `0x3eff766C76a1be2Ce1aCF2B69c78bCae257D5188` |
-| Testnet | `0x01824a90d32A69022DdAEcC6C5C14Ed08dB4EB9B` |
+| Environment | Bridge contract | CrossChainERC20Factory |
+| --- | --- | --- |
+| Mainnet | `0x3eff766C76a1be2Ce1aCF2B69c78bCae257D5188` | `0xDD56781d0509650f8C2981231B6C917f2d5d7dF2` |
+| Testnet | `0x01824a90d32A69022DdAEcC6C5C14Ed08dB4EB9B` | `0x488EB7F7cb2568e31595D48cb26F63963Cc7565D` |
+
+base2sol reads the factory address from the selected Base bridge contract before
+deploying a Base representation for a Solana mint.
 
 ## Solana programs
 

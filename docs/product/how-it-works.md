@@ -39,6 +39,19 @@ When a Base ERC20 has not been bridged before, base2sol starts from Solana:
 5. Once the message is executed on Base, the Base bridge knows the Solana mint
    and decimal scalar.
 
+## First-time Solana token registration
+
+When a Solana mint has not been bridged to Base before, base2sol starts from
+Base:
+
+1. The user enters the Solana mint address and fetches mint decimals.
+2. MetaMask calls the Base bridge's CrossChainERC20Factory.
+3. The factory deploys a Base ERC20 representation for the Solana mint.
+4. base2sol fills the new Base contract into the Solana -> Base transfer form.
+
+This registration is a direct Base transaction. It does not create a pending
+cross-chain message in the operation panel.
+
 The app then switches the user back to the existing-mint transfer flow.
 
 ## Base -> Solana transfers

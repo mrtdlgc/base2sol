@@ -13,7 +13,7 @@ base2sol supports the Base <-> Solana routes exposed by the vendored bridge SDK.
 | Solana -> Base | Solana token | SPL or Token-2022 mint | Locks the Solana token and mints or unlocks the mapped Base ERC20. |
 | Solana -> Base | Base token on Solana | Wrapped Base token mint | Burns on Solana and unlocks the original Base ERC20. |
 
-## First-time vs existing Base token
+## First-time vs existing tokens
 
 For `Base token`, the UI separates two cases:
 
@@ -24,6 +24,17 @@ For `Base token`, the UI separates two cases:
 
 The first-time flow is registration only. After registration executes, the app
 fills the Solana mint and returns to the transfer flow.
+
+For `Solana token`, the UI also separates two cases:
+
+- `Create Base ERC20`: use this when the Solana mint has never been registered
+  on Base.
+- `Use existing ERC20`: use this when the Base CrossChainERC20 representation
+  already exists and you know its address.
+
+The Solana-token first-time flow deploys the Base ERC20 representation through
+the Base bridge's CrossChainERC20Factory. It is a direct Base transaction, not a
+cross-chain message.
 
 ## Token mappings
 
@@ -57,6 +68,9 @@ For a first-time Base token registration:
 - `Base decimals` are read from the ERC20 when metadata fetch succeeds.
 - `Solana decimals` default to a value no higher than the Base decimals.
 - `Base scalar` is `10^(baseDecimals - solanaDecimals)`.
+
+For a first-time Solana token registration, the Base ERC20 representation uses
+the Solana mint decimals.
 
 For existing Base token transfers, the amount field is converted with the Base
 ERC20 decimals. For example, a token with 18 Base decimals and 9 Solana decimals

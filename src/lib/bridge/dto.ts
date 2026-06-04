@@ -55,3 +55,18 @@ export interface WrappedTokenDeploymentResultDTO {
   mint: string;
   initiationTx?: string;
 }
+
+export interface BaseWrappedTokenDeploymentRequestDTO {
+  /** Solana SPL or Token-2022 mint to register and represent on Base. */
+  solanaMint: string;
+  name: string;
+  symbol: string;
+  /** Decimals used by the Solana mint and the Base ERC20 representation. */
+  decimals: number;
+}
+
+export interface BaseWrappedTokenDeploymentResultDTO {
+  baseToken: `0x${string}`;
+  txHash: `0x${string}`;
+  factory: `0x${string}`;
+}

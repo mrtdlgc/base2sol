@@ -14,12 +14,15 @@ import { base as viemBase, baseSepolia as viemBaseSepolia } from "viem/chains";
 import { buildBrowserBridgeClient } from "./bridge";
 import type { EvmConnection, SolanaConnection } from "./wallets/types";
 import type {
+  BaseWrappedTokenDeploymentRequestDTO,
+  BaseWrappedTokenDeploymentResultDTO,
   TokenMappingInput,
   TransferRequestDTO,
   WrappedTokenDeploymentRequestDTO,
   WrappedTokenDeploymentResultDTO,
 } from "@/lib/bridge/dto";
 import { BRIDGE_NETWORKS } from "@/lib/bridge/networks";
+import { bytes32FromSolanaAddress } from "@/lib/bridge/solanaAddress";
 import { nativeAsset, routeFor, tokenAsset, wrappedAsset, type BridgeNetwork } from "@/lib/bridge/routes";
 import { isNativeSolSentinel, ensureAssociatedTokenAccount } from "./wallets/ata";
 import { decode, encode } from "@/lib/bridge/serialize";
@@ -35,6 +38,16 @@ const ERC20_APPROVAL_ABI = parseAbi([
 
 const BRIDGE_MESSAGE_ABI = parseAbi([
   "event MessageInitiated(bytes32 indexed messageHash, bytes32 indexed mmrRoot, (uint64 nonce, address sender, bytes data) message)",
+]);
+
+const BASE_BRIDGE_FACTORY_ABI = parseAbi([
+  "function CROSS_CHAIN_ERC20_FACTORY() view returns (address)",
+]);
+
+const CROSS_CHAIN_ERC20_FACTORY_ABI = parseAbi([
+  "function deploy(bytes32 remoteToken, string name, string symbol, uint8 decimals) returns (address)",
+  "function isCrossChainErc20(address token) view returns (bool)",
+  "event CrossChainERC20Created(address indexed localToken, bytes32 indexed remoteToken, address deployer)",
 ]);
 
 export interface LogEntry {
@@ -380,7 +393,7 @@ export function useBridgeOperation(deps: WalletDeps) {
   const [status, setStatus] = useState<ExecutionStatus | null>(null);
   const [capabilities, setCapabilities] = useState<RouteCapabilities | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
-  const [initiatingKind, setInitiatingKind] = useState<"transfer" | "wrap-token" | null>(null);
+  const [initiatingKind, setInitiatingKind] = useState<"transfer" | "wrap-token" | "base-wrapper" | null>(null);
   const [isPolling, setIsPolling] = useState(false);
   const [isRecovering, setIsRecovering] = useState(false);
   const [log, setLog] = useState<LogEntry[]>([]);
@@ -898,6 +911,125 @@ export function useBridgeOperation(deps: WalletDeps) {
     [op, status?.type, addLog, checkStatus, clientFor, startPolling]
   );
 
+  const deployBaseWrappedToken = useCallback(
+    async (
+      req: BaseWrappedTokenDeploymentRequestDTO
+    ): Promise<BaseWrappedTokenDeploymentResultDTO> => {
+      if (initiatingInFlightRef.current) {
+        throw new Error("An initiation is already in progress. Wait for the wallet flow to finish.");
+      }
+      if (op && status?.type !== "Executed") {
+        throw new Error("A bridge operation is already active. Finish it or clear it before starting another.");
+      }
+      if (!depsRef.current.evm) {
+        throw new Error("Connect MetaMask to create the Base ERC20 representation.");
+      }
+      // The Base ERC20 mirrors the Solana mint 1:1 (no scalar on the factory route),
+      // so decimals must equal the mint's on-chain value, which is a uint8.
+      if (!Number.isInteger(req.decimals) || req.decimals < 0 || req.decimals > 255) {
+        throw new Error("Solana mint decimals are out of the uint8 range.");
+      }
+
+      setPhase("initiating");
+      initiatingInFlightRef.current = true;
+      setInitiatingKind("base-wrapper");
+      addLog("info", `Creating Base ERC20 representation for Solana mint ${req.solanaMint}.`);
+
+      try {
+        const d = depsRef.current;
+        if (!d.evm) {
+          throw new Error("Connect MetaMask to create the Base ERC20 representation.");
+        }
+
+        const chain = d.network === "testnet" ? viemBaseSepolia : viemBase;
+        const publicClient = createPublicClient({
+          chain,
+          transport: http(d.baseRpc, { retryCount: 0, timeout: 10_000 }),
+        });
+        const remoteToken = bytes32FromSolanaAddress(req.solanaMint);
+        const factory = await publicClient.readContract({
+          address: BRIDGE_NETWORKS[d.network].baseBridgeContract,
+          abi: BASE_BRIDGE_FACTORY_ABI,
+          functionName: "CROSS_CHAIN_ERC20_FACTORY",
+        });
+
+        addLog("info", `Using CrossChainERC20Factory ${factory}.`);
+        const simulated = await publicClient.simulateContract({
+          address: factory,
+          abi: CROSS_CHAIN_ERC20_FACTORY_ABI,
+          functionName: "deploy",
+          args: [remoteToken, req.name, req.symbol, req.decimals],
+          account: d.evm.account,
+          chain,
+        });
+
+        const expectedBaseToken = simulated.result as `0x${string}`;
+        const txHash = await d.evm.walletClient.writeContract(simulated.request);
+        addLog("info", `Base wrapper deployment submitted: ${txHash}`);
+        const receipt = await publicClient.waitForTransactionReceipt({
+          hash: txHash,
+          confirmations: 1,
+          timeout: 60_000,
+          pollingInterval: 2_000,
+        });
+        if (receipt.status !== "success") {
+          throw new Error(`Base wrapper deployment reverted: ${txHash}`);
+        }
+
+        const deploymentEvent = receipt.logs
+          .map((log) => {
+            try {
+              return decodeEventLog({
+                abi: CROSS_CHAIN_ERC20_FACTORY_ABI,
+                data: log.data,
+                topics: log.topics,
+              });
+            } catch {
+              return null;
+            }
+          })
+          .find(
+            (event): event is NonNullable<typeof event> =>
+              event?.eventName === "CrossChainERC20Created"
+          );
+
+        const baseToken =
+          deploymentEvent?.eventName === "CrossChainERC20Created"
+            ? deploymentEvent.args.localToken
+            : expectedBaseToken;
+        const recognized = await publicClient
+          .readContract({
+            address: factory,
+            abi: CROSS_CHAIN_ERC20_FACTORY_ABI,
+            functionName: "isCrossChainErc20",
+            args: [baseToken],
+          })
+          .catch(() => false);
+        if (!recognized) {
+          addLog("warn", "The factory deployment succeeded, but the token could not be re-verified from this RPC.");
+        }
+
+        addLog("ok", `Created Base ERC20 ${baseToken}. tx: ${txHash}`);
+        return { baseToken, txHash, factory };
+      } catch (e) {
+        const message = (e as Error).message ?? String(e);
+        // The factory uses CREATE2 over (remoteToken, name, symbol, decimals), so a
+        // redeploy with identical metadata reverts. Point the user at the existing token.
+        const looksLikeCollision = /DeploymentFailed|create2|already|reverted/i.test(message);
+        const hint = looksLikeCollision
+          ? ' This Solana mint may already have a Base ERC20 with the same name, symbol, and decimals. If so, switch to "Use existing ERC20" and enter that Base token instead of deploying a new one.'
+          : "";
+        addLog("error", `Base token registration failed: ${message}${hint}`);
+        throw new Error(`${message}${hint}`);
+      } finally {
+        initiatingInFlightRef.current = false;
+        setInitiatingKind(null);
+        setPhase("idle");
+      }
+    },
+    [op, status?.type, addLog]
+  );
+
   const recoverWrappedTokenRegistration = useCallback(
     async (signature: string) => {
       const cleanSignature = signature.trim();
@@ -1093,6 +1225,7 @@ export function useBridgeOperation(deps: WalletDeps) {
     log,
     transfer,
     deployWrappedToken,
+    deployBaseWrappedToken,
     recoverWrappedTokenRegistration,
     recoverBaseTransfer,
     prove,
